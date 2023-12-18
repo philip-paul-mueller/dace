@@ -105,7 +105,7 @@ def test_nsdfg_memlet_propagation_with_one_sparse_dimension():
 
 
 def _test_nsdfg_memlet_propagation_with_slicing(slice_col):
-    
+
     dim_X, dim_Y = (dace.symbol(s) for s in ('dim_X', 'dim_Y'))
 
     def build_nsdfg():

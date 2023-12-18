@@ -1074,7 +1074,6 @@ def propagate_memlets_nested_sdfg(parent_sdfg, parent_state, nsdfg_node):
                 # case, use the entire range.
                 if border_memlet.src_subset is not None:
                     fallback_subset = subsets.Range.from_array(sdfg.arrays[border_memlet.data])
-                    fallback_offset = len(border_memlet.src_subset) - len(fallback_subset)
                     for i, rng in enumerate(border_memlet.src_subset):
                         fall_back = False
                         for item in rng:
@@ -1082,7 +1081,8 @@ def propagate_memlets_nested_sdfg(parent_sdfg, parent_state, nsdfg_node):
                                 fall_back = True
                                 break
                         if fall_back:
-                            border_memlet.src_subset[i] = fallback_subset[i - fallback_offset]
+                            assert len(fallback_subset) == len(border_memlet.src_subset)
+                            border_memlet.src_subset[i] = fallback_subset[i]
                 if border_memlet.dst_subset is not None:
                     fallback_subset = subsets.Range.from_array(sdfg.arrays[border_memlet.data])
                     for i, rng in enumerate(border_memlet.dst_subset):
@@ -1092,6 +1092,7 @@ def propagate_memlets_nested_sdfg(parent_sdfg, parent_state, nsdfg_node):
                                 fall_back = True
                                 break
                         if fall_back:
+                            assert len(fallback_subset) == len(border_memlet.dst_subset)
                             border_memlet.dst_subset[i] = fallback_subset[i]
 
     # Propagate the inside 'border' memlets outside the SDFG by
