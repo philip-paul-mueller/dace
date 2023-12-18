@@ -119,7 +119,7 @@ def test_nsdfg_memlet_propagation_with_slicing():
         state2.add_edge(
             state2.add_access('_inp'), None,
             state2.add_access('_out'), None,
-            dace.Memlet(data='_out', subset='0:dim_X', other_subset='0:dim_X, y')
+            dace.Memlet(data='_inp', subset='0:dim_X, y', other_subset='0:dim_X')
         )
         return sdfg
 
