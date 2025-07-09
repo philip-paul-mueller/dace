@@ -52,6 +52,7 @@ class PruneConnectors(pm.SingleStateTransformation):
         # NOTE: If a data container is used for reading and writing then only the
         #  output connector is retained, except the output is a WCR, then the input
         #  is also retained.
+        # TODO(phimuell): Find a way to to cache this, probably use the pipeline infrastructure.
         read_set, write_set = nsdfg.sdfg.read_and_write_sets()
         prune_in = nsdfg.in_connectors.keys() - read_set
         prune_out = nsdfg.out_connectors.keys() - write_set
@@ -153,10 +154,27 @@ class PruneSymbols(pm.SingleStateTransformation):
 
         return candidates
 
+    def _find_symbols_that_can_not_be_removed(self, sdfg: SDFG) -> Set[str]:
+        """Find the set of symbols that is used.
+
+        This function is based on the previous use of `dace.transformation.helpers.is_symbol_unused()`.
+        That was scanning the whole SDFG for every candidate symbol. The set that is computed by this
+        function is based on that function, but it should probably be replaced with a call to
+        `sdfg.used_symbols()`.
+        """
+        unremovable_symbols: Set[str] = set()
+
+        for desc in sdfg.arrays.values():
+            unremovable_symbols.update(map(str, desc.free_symbols))
+        for state in sdfg.states():  # Previously `nodes()` was used.
+            unremovable_symbols.update(state.free_symbols)
+        for e in sdfg.edges():  # Are this all edges?
+            unremovable_symbols.update(e.data.free_symbols)
+        return unremovable_symbols
+
     def can_be_applied(self, graph: SDFGState, expr_index: int, sdfg: SDFG, permissive: bool = False) -> bool:
 
         nsdfg: nodes.NestedSDFG = self.nsdfg
-
         if len(PruneSymbols._candidates(nsdfg)) > 0:
             return True
 
@@ -164,11 +182,12 @@ class PruneSymbols(pm.SingleStateTransformation):
 
     def apply(self, graph: SDFGState, sdfg: SDFG):
         nsdfg = self.nsdfg
-
         candidates = PruneSymbols._candidates(nsdfg)
+        unremovable_symbols = self._find_symbols_that_can_not_be_removed(sdfg)
+
         for candidate in candidates:
             del nsdfg.symbol_mapping[candidate]
 
             # If not used in SDFG, remove from symbols as well
-            if helpers.is_symbol_unused(nsdfg.sdfg, candidate):
+            if candidate not in unremovable_symbols:
                 nsdfg.sdfg.remove_symbol(candidate)
