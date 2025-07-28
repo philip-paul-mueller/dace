@@ -100,8 +100,10 @@ class InlineSDFG(transformation.SingleStateTransformation):
         nested_sdfg = self.nested_sdfg
         if nested_sdfg.no_inline:
             return False
-        if len(nested_sdfg.sdfg.nodes()) != 1 or not isinstance(nested_sdfg.sdfg.nodes()[0], SDFGState):
+        nested_nodes = list(nested_sdfg.sdfg.nodes())
+        if len(nested_nodes) != 1 or not isinstance(nested_nodes[0], SDFGState):
             return False
+        nested_state = nested_nodes[0]
 
         # Ensure every connector has one incoming/outgoing edge and that it
         # is not empty
@@ -112,6 +114,10 @@ class InlineSDFG(transformation.SingleStateTransformation):
                 return False
             if (edge.data.is_empty() and not isinstance(edge.src, nodes.EntryNode)):
                 return False
+
+            if isinstance(edge.src, nodes.AccessNode) and graph.degree(edge.src) != 1:
+                pass  #return False
+
             # NOTE: Empty memlets do not attach to connectors
             if edge.dst_conn or not edge.data.is_empty():
                 in_connectors.add(edge.dst_conn)
@@ -120,6 +126,10 @@ class InlineSDFG(transformation.SingleStateTransformation):
                 return False
             if (edge.data.is_empty() and not isinstance(edge.dst, nodes.ExitNode)):
                 return False
+
+            if isinstance(edge.dst, nodes.AccessNode) and graph.degree(edge.dst) != 1:
+                pass  #return False
+
             # NOTE: Empty memlets do not attach to connectors
             if edge.src_conn or not edge.data.is_empty():
                 out_connectors.add(edge.src_conn)
@@ -128,15 +138,15 @@ class InlineSDFG(transformation.SingleStateTransformation):
         # and ensure no two connectors are directly connected to each other
         if graph.entry_node(nested_sdfg) is not None:
             all_connectors = in_connectors | out_connectors
-            nstate = nested_sdfg.sdfg.node(0)
-            for node in nstate.nodes():
+            nested_state = nested_sdfg.sdfg.node(0)
+            for node in nested_state.nodes():
                 if isinstance(node, nodes.AccessNode):
-                    if (node.data in out_connectors and nstate.out_degree(node) > 0
-                            and (node.data not in in_connectors or nstate.in_degree(node) > 0)):
+                    if (node.data in out_connectors and nested_state.out_degree(node) > 0
+                            and (node.data not in in_connectors or nested_state.in_degree(node) > 0)):
                         return False
                     if (node.data in in_connectors
                             and any(e.dst.data in all_connectors
-                                    for e in nstate.out_edges(node) if isinstance(e.dst, nodes.AccessNode))):
+                                    for e in nested_state.out_edges(node) if isinstance(e.dst, nodes.AccessNode))):
                         return False
 
         # Ensure that every connector has at least one corresponding access
@@ -155,8 +165,7 @@ class InlineSDFG(transformation.SingleStateTransformation):
                 out_data[dst.data] = e.src_conn
         rem_inpconns = dc(in_connectors)
         rem_outconns = dc(out_connectors)
-        nstate: SDFGState = nested_sdfg.sdfg.nodes()[0]
-        for node in nstate.nodes():
+        for node in nested_state.nodes():
             if isinstance(node, nodes.AccessNode):
                 if node.data in rem_inpconns:
                     rem_inpconns.remove(node.data)

@@ -10,6 +10,8 @@ import numpy as np
 import os
 import pytest
 
+from .transformations import utility as tutils
+
 W = dace.symbol('W')
 H = dace.symbol('H')
 
@@ -623,6 +625,82 @@ def test_inlining_view_input():
     expected = np.concatenate([A @ B.T, A @ B.T], axis=0)
     actual = sdfg(A=A, B=B)
     np.testing.assert_allclose(expected, actual)
+
+
+def _make_single_state_inlining_with_external_data_flow() -> Tuple[dace.SDFG, dace.SDFGState, dace_nodes.NestedSDFG]:
+
+    def _make_inner_sdfg() -> dace.SDFG:
+        sdfg = dace.SDFG(tutils.unique_name("internal"))
+        state = sdfg.add_state(is_start_block=True)
+        anames = ["I", "A", "B"]
+        for aname in anames:
+            sdfg.add_array(
+                aname,
+                shape=(10, ),
+                dtype=dace.float64,
+                transient=False,
+            )
+        I, A, B = (state.add_access(aname) for aname in anames)
+
+        state.add_mapped_tasklet(
+            "comp1",
+            map_ranges={"__i": "0:10"},
+            inputs={"__in": dace.Memlet("I[__i]")},
+            code="__out = __in + 1.0",
+            outputs={"__out": dace.Memlet("A[__i]")},
+            input_nodes={I},
+            output_nodes={A},
+            external_edges=True,
+        )
+        state.add_mapped_tasklet(
+            "comp2",
+            map_ranges={"__j": "0:10"},
+            inputs={"__in": dace.Memlet("A[__j]")},
+            code="__out = math.sin(__in)",
+            outputs={"__out": dace.Memlet("B[__j]")},
+            input_nodes={A},
+            output_nodes={B},
+            external_edges=True,
+        )
+        return sdfg
+
+    sdfg = dace.SDFG(tutils.unique_name("single_state_inlining_with_external_dataflow_sdfg"))
+    state = sdfg.add_state(is_start_block=True)
+    anames = ["i", "a", "b", "t"]
+    for aname in anames:
+        sdfg.add_array(
+            aname,
+            shape=(10, ),
+            dtype=dace.float64,
+            transient=aname.startswith("t"),
+        )
+    i, a, b, t = (state.add_access(aname) for aname in anames)
+
+    nsdfg_node = state.add_nested_sdfg(
+        sdfg=_make_inner_sdfg(),
+        parent=sdfg,
+        inputs={"I"},
+        outputs={"A", "B"},
+        symbol_mapping={},
+    )
+
+    state.add_edge(i, None, nsdfg_node, "I", dace.Memlet("i[0:10]"))
+    state.add_edge(nsdfg_node, "A", t, None, dace.Memlet("t[0:10]"))
+    state.add_nedge(t, a, dace.Memlet("t[0:10] -> [0:10]"))
+    state.add_edge(nsdfg_node, "B", b, None, dace.Memlet("b[0:10]"))
+    sdfg.validate()
+
+    return sdfg, state, nsdfg_node
+
+
+def test_single_state_inline_with_external_dataflow():
+    sdfg, state, nsdfg_node = _make_single_state_inlining_with_external_data_flow()
+
+    count = sdfg.apply_transformations_repeated([InlineSDFG], validate=True, validate_all=True)
+
+    sdfg.view()
+
+    breakpoint()
 
 
 if __name__ == "__main__":
