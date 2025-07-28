@@ -115,9 +115,6 @@ class InlineSDFG(transformation.SingleStateTransformation):
             if (edge.data.is_empty() and not isinstance(edge.src, nodes.EntryNode)):
                 return False
 
-            if isinstance(edge.src, nodes.AccessNode) and graph.degree(edge.src) != 1:
-                pass  #return False
-
             # NOTE: Empty memlets do not attach to connectors
             if edge.dst_conn or not edge.data.is_empty():
                 in_connectors.add(edge.dst_conn)
@@ -126,9 +123,6 @@ class InlineSDFG(transformation.SingleStateTransformation):
                 return False
             if (edge.data.is_empty() and not isinstance(edge.dst, nodes.ExitNode)):
                 return False
-
-            if isinstance(edge.dst, nodes.AccessNode) and graph.degree(edge.dst) != 1:
-                pass  #return False
 
             # NOTE: Empty memlets do not attach to connectors
             if edge.src_conn or not edge.data.is_empty():
