@@ -21,8 +21,10 @@ from dace.transformation import transformation as pm
 # Helper methods #############################################################
 
 
-def _subset_has_shape(subset: subsets.Subset, shape: Sequence[int]) -> bool:
-    return len(subset.size()) == len(shape) and all(m == a for m, a in zip(subset.size(), shape))
+def _subset_has_shape(subset: subsets.Range, shape: Sequence[symbolic.SymbolicType]) -> bool:
+    """Check if `subset` has the size given in `shape`."""
+    return subset.dims() == len(shape) and all((m == a) == True  # SymPy comparison
+                                               for m, a in zip(subset.size(), shape))
 
 
 def _validate_subsets(edge: graph.MultiConnectorEdge,
@@ -118,10 +120,43 @@ def _validate_subsets(edge: graph.MultiConnectorEdge,
 
 
 def find_dims_to_pop(a_size, b_size):
+    """Determine how the first subset has to be squeezed to get to the dimension of the second subset.
+
+    Essentially the function determines which dimensions from the subset `A` have to be removed
+    to get down to the dimensionality of subset `B`. In case they have the same dimensionality
+    an empty list is returned.
+    It is important that this function does not operates on the actual subsets but on their
+    sizes.
+    """
+    if len(a_size) < len(b_size):
+        raise ValueError(
+            f"Expected that subset `A` has a larger rank ({len(a_size)} | {a_size}) than subset `B` ({len(b_size)} | {b_size})"
+        )
+    if len(a_size) == len(b_size):
+        return []
+
     dims_to_pop = []
-    for i, sz in enumerate(reversed(a_size)):
-        if sz not in b_size:
-            dims_to_pop.append(len(a_size) - 1 - i)
+    b_dim_to_check = 0
+    for dim_to_pop, a_sz in enumerate(a_size):
+        b_sz = b_size[b_dim_to_check]
+        if (a_sz == b_sz) == True:  # SymPy comparison.
+            # They are the same, thus we do not have to pop the dimension, but we have
+            #  to advance the `B` pointer.
+            b_dim_to_check += 1
+        else:
+            # They are different thus we have to pop the dimension, but we do _not_
+            #  have to advance the `B` pointer, as we have to reuse it in the next
+            #  iteration again.
+            # TODO: Check if we have to ensure that `a_sz` is 1.
+            dims_to_pop.append(dim_to_pop)
+
+    if b_dim_to_check != len(b_size):
+        raise ValueError(
+            f"Could not associate all `B` dimensions to an `A` dimension, only matched {b_dim_to_check} of {len(b_size)}"
+        )
+    if len(a_size) - len(b_size) != len(dims_to_pop):
+        raise ValueError(f"Expected to pop {len(a_size) - len(b_size)} but only popped {len(dims_to_pop)}")
+
     return dims_to_pop
 
 
@@ -454,9 +489,16 @@ class RedundantArray(pm.SingleStateTransformation):
             if in_array.data in sdfg.arrays:
                 del sdfg.arrays[in_array.data]
             return
+
+        # NOTE: This is probably wrong! Since we replace `in_array` with a View the view must
+        #   follow the strides of `out_array`, since `in_array` views the memory of `out_array`.
+        #   Furthermore, `RedundantSecondArray` makes a case distinction here, when it composes
+        #   the strides for the view which is not done here. However, there is the
+        #   `_is_reshaping_memlet()` function that should handle some cases.
         view_strides = in_desc.strides
         if (b_dims_to_pop and len(b_dims_to_pop) == len(out_desc.shape) - len(in_desc.shape)):
             view_strides = [s for i, s in enumerate(out_desc.strides) if i not in b_dims_to_pop]
+
         sdfg.arrays[in_array.data] = data.ArrayView(in_desc.dtype, in_desc.shape, True, in_desc.allow_conflicts,
                                                     out_desc.storage, out_desc.location, view_strides, in_desc.offset,
                                                     out_desc.may_alias, dtypes.AllocationLifetime.Scope,
@@ -983,9 +1025,37 @@ class RedundantSecondArray(pm.SingleStateTransformation):
                 if len(graph.all_edges(in_array)) == 0:
                     graph.remove_node(in_array)
                 return
-            view_strides = out_desc.strides
-            if (a_dims_to_pop and len(a_dims_to_pop) == len(in_desc.shape) - len(out_desc.shape)):
-                view_strides = [s for i, s in enumerate(in_desc.strides) if i not in a_dims_to_pop]
+
+            # We now need to figuring out which stride we are using. Since we replace `out_array`
+            #  with a view, we must use the same strides for it as `in_array`. But depending on
+            #  the situation, we need to modify them a bit.
+            in_dim = len(in_desc.shape)
+            out_dim = len(out_desc.shape)
+            if in_dim < out_dim:
+                # `out_array` has more dimensions, we thus have to replace the some strides
+                #  in `out_array` with the ones from `in_array` the extra ones will remain.
+                assert len(b_dims_to_pop) == out_dim - in_dim
+                view_strides = []
+                in_index = 0
+                for out_index in range(out_dim):
+                    if out_index in b_dims_to_pop:
+                        # The dimension is additional, thus we use the original value.
+                        view_strides.append(out_desc.strides[out_index])
+                    else:
+                        view_strides.append(in_desc.strides[in_index])
+                        in_index += 1
+                assert in_index == in_dim
+                assert len(view_strides) == out_dim
+                view_strides = tuple(view_strides)
+            elif in_dim > out_dim:
+                # `in_array` has more dimensions, thus we can simply remove the ones that we
+                #  no longer need.
+                assert len(a_dims_to_pop) == in_dim - out_dim
+                view_strides = tuple(s for i, s in enumerate(in_desc.strides) if i not in a_dims_to_pop)
+            else:
+                # The two have the same dimensionality, thus there is no modifications
+                view_strides = in_desc.strides
+
             sdfg.arrays[out_array.data] = data.ArrayView(out_desc.dtype, out_desc.shape, True, out_desc.allow_conflicts,
                                                          in_desc.storage, in_desc.location, view_strides,
                                                          out_desc.offset, in_desc.may_alias,
