@@ -556,10 +556,14 @@ with open(r"{temp_path}", "wb") as f:
         callparams = tuple((carg, aname) for arg, carg, aname in zip(arglist, cargs, argnames)
                            if not (symbolic.issymbolic(arg) and (hasattr(arg, 'name') and arg.name in constants)))
 
-        newargs = tuple(carg for carg, aname in callparams)
+        # NOTE: While it makes sense to modify `self._lastargs[0]` it does not make sense to
+        #   modify `self._lastargs[1]`, i.e. `initargs`, because it is only used the first time.
+        #   The reason why modification of `self._lastargs[0]` is useful that it allows fast
+        #   dispatch from Python, for example in GT4Py.next.
+        newargs = [carg for carg, aname in callparams]
         initargs = tuple(carg for carg, aname in callparams if aname in symbols)
 
-        self._lastargs = newargs, initargs
+        self._lastargs = (newargs, initargs)
         return self._lastargs
 
     def clear_return_values(self):
