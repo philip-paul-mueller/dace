@@ -1,4 +1,5 @@
-# Copyright 2019-2025 ETH Zurich and the DaCe authors. All rights reserved.
+# Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
+"""Tracks GPU stream slots and maps stream-using nodes to their assigned ``gpuStream_t``."""
 from typing import Dict
 from dace import SDFG, nodes
 from dace.transformation.passes.gpu_specialization.helpers.gpu_helpers import get_gpu_stream_array_name
@@ -6,26 +7,21 @@ from dace.transformation.passes.gpu_specialization.helpers.gpu_helpers import ge
 
 class GPUStreamManager:
     """
-    Manage GPU backend streams (e.g., CUDA or HIP) for nodes in an SDFG.
+    Manage GPU backend streams (CUDA/HIP) for SDFG nodes.
 
-    Nodes are assigned stream IDs by the NaiveGPUStreamScheduler Pass, and
-    this class provides their access expressions and tracks the number of streams
-    in use. GPU events are not (yet) supported.
-
-    Note
-    ----
-    "Stream" refers to backend GPU streams, not DaCe data streams.
+    Given the per-node stream IDs assigned by ``NaiveGPUStreamScheduler``, provides their access
+    expressions and the stream count. GPU events are not yet supported. "Stream" here means a
+    backend GPU stream, not a DaCe data stream.
     """
 
     def __init__(self, sdfg: SDFG, assignments: Dict[nodes.Node, int]):
         self.sdfg = sdfg
         self._stream_access_template = "__state->gpu_context->streams[{gpu_stream}]"
         self._assignments = assignments
-        # ``num_gpu_streams`` is the source-of-truth set by ``InsertGPUStreams``
-        # when it added the descriptor; reading the shape avoids re-deriving via
-        # ``max(assignments) + 1`` which is not invariant under pipeline
-        # re-application (the scheduler's WCC walk is graph-shape-dependent and
-        # the pipeline mutates the graph).
+        # Stream count comes from the ``gpu_streams`` descriptor shape (set by the GPU stream
+        # scheduler via ``allocate_stream_array``), not from
+        # ``max(assignments) + 1`` -- the latter is not invariant under pipeline re-application
+        # (the scheduler's WCC walk is graph-shape-dependent and the pipeline mutates the graph).
         stream_array = get_gpu_stream_array_name()
         if stream_array in sdfg.arrays:
             self._num_gpu_streams = int(sdfg.arrays[stream_array].shape[0])
@@ -49,7 +45,7 @@ class GPUStreamManager:
 
     @property
     def num_gpu_events(self) -> int:
-        """Always 0 — events aren't wired through the new pipeline yet, but the
+        """Always 0 -- events aren't wired through the new pipeline yet, but the
         codegen template still emits create/destroy loops over this count."""
         return 0
 

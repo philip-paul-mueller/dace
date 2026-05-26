@@ -1,5 +1,9 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
+"""Tests for :class:`AssignmentAndCopyKernelToMemsetAndMemcpy`.
 
+Verifies the lifting of in-map memset / element-wise-copy patterns to ``MemsetLibraryNode``
+and ``CopyLibraryNode`` instances, across pure / CPU / CUDA expansion variants.
+"""
 import functools
 import dace
 import numpy
@@ -40,10 +44,8 @@ def _get_sdfg(
     non_zero: bool,
     subset_in_first_dim: bool,
 ) -> dace.SDFG:
-    """
-    Construct an SDFG that performs a configurable number of memcpy and memset
-    operations, possibly with extra computation or non-zero memsets.
-    """
+    """Build an SDFG with a configurable number of memcpy/memset map paths,
+    optionally adding extra computation, non-zero fills, or a first-dim subset."""
 
     sdfg = dace.SDFG("main")
     state = sdfg.add_state("memset_memcpy_maps")
@@ -60,7 +62,7 @@ def _get_sdfg(
         },
     )
 
-    # Select memset value: 0.0 or 1.0 depending on `non_zero`
+    # Select memset value: 0.0 or 1.0 depending on ``non_zero``
     assign_value = "0" if not non_zero else "1"
 
     # Create each memcpy or memset node
@@ -93,7 +95,7 @@ def _get_sdfg(
 
         # Handle input connection for memcpy
         if is_memcpy:
-            # Connect array → map → tasklet
+            # Connect array -> map -> tasklet
             state.add_edge(
                 state.add_access(in_name),
                 None,
@@ -160,7 +162,7 @@ def _get_sdfg(
                 dace.memlet.Memlet(f"{out_name}[i, j]"),
             )
         else:
-            # Normal write path: tasklet → map_exit
+            # Normal write path: tasklet -> map_exit
             state.add_edge(
                 tasklet,
                 "_out",
@@ -169,7 +171,7 @@ def _get_sdfg(
                 dace.memlet.Memlet(f"{out_name}[i, j]"),
             )
 
-        # Final output: map_exit → output array
+        # Final output: map_exit -> output array
         state.add_edge(
             map_exit,
             f"OUT_{out_name}",
@@ -193,9 +195,12 @@ def _get_num_memset_library_nodes(sdfg: dace.SDFG) -> int:
     return sum(isinstance(node, MemsetLibraryNode) for node, state in sdfg.all_nodes_recursive())
 
 
-# MemsetLibraryNode kept the legacy ``pure`` / ``CPU`` / ``CUDA`` impl names;
-# CopyLibraryNode renamed to ``MappedTasklet`` / ``MemcpyCPU`` / ``MemcpyCUDA1D``.
-# Tests still parametrize on the legacy label and translate per type here.
+def _get_num_nested_sdfgs(sdfg: dace.SDFG) -> int:
+    return sum(isinstance(node, dace.nodes.NestedSDFG) for node, state in sdfg.all_nodes_recursive())
+
+
+# MemsetLibraryNode and CopyLibraryNode use different impl-name vocabularies.
+# Tests parametrize on the Memset names; map them to the Copy names here.
 _COPY_IMPL_FROM_EXPANSION_TYPE = {
     "pure": "MappedTasklet",
     "CPU": "MemcpyCPU",
@@ -255,7 +260,7 @@ def _prepare_sdfg(sdfg: dace.SDFG, expansion_type: str, name_suffix: str = "") -
     return sdfg
 
 
-def _expand_and_validate(sdfg: dace.SDFG, expansion_type: str) -> None:
+def _expand_and_validate(sdfg: dace.SDFG, expansion_type: str):
     _set_lib_node_type(sdfg, expansion_type)
     sdfg.expand_library_nodes(recursive=True)
     sdfg.validate()
@@ -440,7 +445,7 @@ def test_double_memcpy_with_dynamic_connectors(expansion_type, xp):
     p.apply_pass(sdfg, {})
     for n, g in sdfg.all_nodes_recursive():
         if isinstance(n, dace.nodes.NestedSDFG):
-            p.apply_pass(n.sdfg)
+            p.apply_pass(n.sdfg, {})
     sdfg.validate()
     assert _get_num_memcpy_library_nodes(sdfg) == 2
     assert _get_num_memset_library_nodes(sdfg) == 0
@@ -693,7 +698,7 @@ def _get_nested_memcpy_with_dimension_change_and_fortran_strides(full_inner_rang
     return sdfg
 
 
-# expected_memcpy is 1 only with fortran_strides=True — C-strides can't be
+# expected_memcpy is 1 only with fortran_strides=True -- C-strides can't be
 # collapsed into a single memcpy because of the dimension change.
 @pytest.mark.parametrize("expansion_type", EXPANSION_TYPES)
 @pytest.mark.parametrize(
@@ -721,6 +726,243 @@ def test_nested_memcpy_with_dimension_change_and_strides(expansion_type, xp, ful
     else:
         for j in range(DIM_SIZE):
             assert xp.allclose(B_IN[0:DIM_SIZE, j], A_IN), f"{j}: {B_IN[0:DIM_SIZE, j] - A_IN}"
+
+
+def test_transpose_map_is_not_lifted_to_memcpy():
+    """A ``_out = _in`` map whose in/out subsets permute the map indices is a
+    transpose, not a copy, so it is left unlifted (no ``CopyLibraryNode``)."""
+    sdfg = dace.SDFG("transpose_pin")
+    sdfg.add_array("A", [5, 3], dace.float64)
+    sdfg.add_array("AT", [3, 5], dace.float64)
+    state = sdfg.add_state("main")
+    a = state.add_access("A")
+    at = state.add_access("AT")
+    me, mx = state.add_map("transpose_map", {"i": "0:5", "j": "0:3"})
+    t = state.add_tasklet("tr", {"_in"}, {"_out"}, "_out = _in")
+    state.add_memlet_path(a, me, t, dst_conn="_in", memlet=dace.Memlet("A[i, j]"))
+    state.add_memlet_path(t, mx, at, src_conn="_out", memlet=dace.Memlet("AT[j, i]"))
+
+    AssignmentAndCopyKernelToMemsetAndMemcpy().apply_pass(sdfg, {})
+    assert _get_num_memcpy_library_nodes(sdfg) == 0, (
+        "Transpose pattern (in subset [i, j], out subset [j, i]) was incorrectly "
+        "lifted to a CopyLibraryNode -- the pass treats permutation as pure copy.")
+
+
+def test_inkernel_memset_is_not_lifted():
+    """A memset map nested inside a ``GPU_Device`` map is left unlifted (no
+    ``MemsetLibraryNode``) because ``cudaMemsetAsync`` cannot run from device code."""
+
+    @dace.program
+    def kernel_with_inner_memset(A: dace.float64[128, 64] @ dace.StorageType.GPU_Global):
+        for i in dace.map[0:128] @ dace.ScheduleType.GPU_Device:
+            scratch = dace.define_local([64], numpy.float64, storage=dace.StorageType.GPU_Global)
+            for j in dace.map[0:64] @ dace.ScheduleType.Sequential:
+                scratch[j] = 0
+            A[i, :] = scratch
+
+    sdfg = kernel_with_inner_memset.to_sdfg(simplify=True)
+    AssignmentAndCopyKernelToMemsetAndMemcpy().apply_pass(sdfg, {})
+    assert _get_num_memset_library_nodes(sdfg) == 0, (
+        "An in-kernel memset (Sequential map inside GPU_Device) was lifted to a "
+        "MemsetLibraryNode -- but cudaMemsetAsync is host-only and cannot run from "
+        "device code. The pass should skip maps nested in any GPU scope.")
+
+
+def test_single_element_memset_is_not_lifted():
+    """A memset over a single-element array is left unlifted (no
+    ``MemsetLibraryNode``) because its pure expansion collapses to an empty map."""
+
+    @dace.program
+    def single_element_zero(A: dace.float64[1]):
+        for i in dace.map[0:1]:
+            A[i] = 0
+
+    sdfg = single_element_zero.to_sdfg(simplify=True)
+    AssignmentAndCopyKernelToMemsetAndMemcpy().apply_pass(sdfg, {})
+    assert _get_num_memset_library_nodes(sdfg) == 0, (
+        "A single-element memset was lifted to a MemsetLibraryNode; the pure "
+        "expansion would collapse to an empty map and crash propagation.")
+
+
+def test_single_element_memcpy_is_not_lifted():
+    """A memcpy over a single element is left unlifted (no ``CopyLibraryNode``)
+    because its pure expansion collapses to a degenerate map."""
+
+    @dace.program
+    def single_element_copy(A: dace.float64[1], B: dace.float64[1]):
+        for i in dace.map[0:1]:
+            B[i] = A[i]
+
+    sdfg = single_element_copy.to_sdfg(simplify=True)
+    AssignmentAndCopyKernelToMemsetAndMemcpy().apply_pass(sdfg, {})
+    assert _get_num_memcpy_library_nodes(sdfg) == 0, (
+        "A single-element memcpy was lifted to a CopyLibraryNode; the pure "
+        "expansion would collapse to an empty map and crash propagation.")
+
+
+def test_shared_passthrough_connector_blocks_lift():
+    """A memset whose ``MapExit`` passthrough connector is shared with a compute
+    tasklet is left unlifted (no ``MemsetLibraryNode``) and the SDFG stays valid."""
+    sdfg = dace.SDFG("shared_passthrough_pin")
+    sdfg.add_array("A", [10], dace.float64, dace.StorageType.GPU_Global)
+    state = sdfg.add_state("main")
+    a = state.add_access("A")
+    me, mx = state.add_map("kernel", {"i": "0:10"}, schedule=dace.ScheduleType.GPU_Device)
+    # Two tasklets sharing the SAME ``MapExit.IN_A`` passthrough -- like
+    # the deriche pattern where a boundary memset and a per-thread
+    # compute both write to a single aggregate ``MapExit OUT_A -> A``
+    # edge. ``add_memlet_path`` auto-renames conflicting connectors, so
+    # build the shared-connector topology with explicit ``add_edge`` /
+    # ``add_in_connector``.
+    t_zero = state.add_tasklet("zero", set(), {"_out"}, "_out = 0")
+    t_compute = state.add_tasklet("compute", set(), {"_out"}, "_out = 3.14")
+    state.add_nedge(me, t_zero, dace.Memlet())
+    state.add_nedge(me, t_compute, dace.Memlet())
+    mx.add_in_connector("IN_A")
+    mx.add_out_connector("OUT_A")
+    state.add_edge(t_zero, "_out", mx, "IN_A", dace.Memlet("A[i]"))
+    state.add_edge(t_compute, "_out", mx, "IN_A", dace.Memlet("A[i]"))
+    state.add_edge(mx, "OUT_A", a, None, dace.Memlet("A[0:10]"))
+
+    AssignmentAndCopyKernelToMemsetAndMemcpy().apply_pass(sdfg, {})
+    assert _get_num_memset_library_nodes(sdfg) == 0, (
+        "Memset over a shared MapExit passthrough connector was lifted to a "
+        "MemsetLibraryNode; this severs the compute tasklet's data path.")
+    # SDFG should still be valid (no orphan connectors / edges left behind).
+    sdfg.validate()
+
+
+def test_lift_drops_dynamic_range_connector_with_arbitrary_name():
+    # The map_entry receives a dynamic-range scalar on a CUSTOM-named connector
+    # (not the auto-generated ``__map_*`` prefix). The libnode doesn't iterate
+    # so the dynamic input must not be propagated; otherwise the libnode ends
+    # up with a dangling connector that codegen later trips on.
+    Ub = dace.symbol('Ub')
+    sdfg = dace.SDFG('arbitrary_dyn_conn')
+    sdfg.add_array('src', [DIM_SIZE, DIM_SIZE], dace.float64)
+    sdfg.add_array('dst', [DIM_SIZE, DIM_SIZE], dace.float64)
+    sdfg.add_scalar('upper_bound', dace.int32)
+    state = sdfg.add_state('s')
+    src = state.add_access('src')
+    dst = state.add_access('dst')
+    ub = state.add_access('upper_bound')
+
+    me, mx = state.add_map('cpy_map', {'i': '0:Ub', 'j': '0:Ub'})
+    me.add_in_connector('Ub_in')
+    state.add_edge(ub, None, me, 'Ub_in', dace.Memlet('upper_bound[0]'))
+
+    t = state.add_tasklet('copy_t', {'_in'}, {'_out'}, '_out = _in')
+    state.add_memlet_path(src, me, t, dst_conn='_in', memlet=dace.Memlet('src[i, j]'))
+    state.add_memlet_path(t, mx, dst, src_conn='_out', memlet=dace.Memlet('dst[i, j]'))
+
+    AssignmentAndCopyKernelToMemsetAndMemcpy(overapproximate_first_dimensions=True).apply_pass(sdfg, {})
+    sdfg.validate()
+    for n, _ in sdfg.all_nodes_recursive():
+        if isinstance(n, CopyLibraryNode):
+            assert 'Ub_in' not in n.in_connectors
+
+
+# A dynamic map-range bound (a scalar fed into the map entry) becomes a symbol
+# in the lifted library node's subset. Since the updated libnodes reject dynamic
+# input connectors, the pass promotes that scalar to an in-scope symbol. When the
+# scalar is NOT written in the map's state it is hoisted to a preceding-state
+# interstate-edge assignment; when it IS written there the map is nested in its
+# own SDFG (whole arrays passed in, scalar arriving as a read-only input) and
+# lifted inside. Both are automatic end-effects, not configurable.
+
+
+@dace.program
+def _memset_1d_dynamic_bound(kfdia: dace.int32, kidia: dace.int32, zsinksum: dace.float64[D]):
+    for j in dace.map[kidia - 1:kfdia:1]:
+        zsinksum[j] = 0.0
+
+
+@pytest.mark.parametrize("expansion_type", EXPANSION_TYPES)
+@temporarily_disable_autoopt_and_serialization
+def test_dynamic_bound_param_uses_symbol_hoist(expansion_type, xp):
+    """A read-only scalar bound is hoisted to a symbol on a preceding state; no nested SDFG is created."""
+    sdfg = _prepare_sdfg(_sdfg_from_program(_memset_1d_dynamic_bound), expansion_type, "hoist")
+
+    AssignmentAndCopyKernelToMemsetAndMemcpy(overapproximate_first_dimensions=False).apply_pass(sdfg, {})
+    assert _get_num_memset_library_nodes(sdfg) == 1
+    assert _get_num_nested_sdfgs(sdfg) == 0, "a read-only bound must be hoisted, not nested"
+
+    B_IN = xp.ones(DIM_SIZE)
+    _expand_and_validate(sdfg, expansion_type)
+    sdfg(zsinksum=B_IN, kidia=3, kfdia=8, D=DIM_SIZE)
+    expected = xp.ones(DIM_SIZE)
+    expected[2:8] = 0.0
+    assert xp.allclose(B_IN, expected)
+
+
+def _build_in_state_written_bound_sdfg() -> dace.SDFG:
+    """``base`` -> tasklet -> ``bnd_val`` -> (dynamic range) memset map, all in one state.
+
+    The bound scalar ``bnd_val`` is written in the map's own state, so the pass must use the
+    nested-SDFG fallback rather than a preceding-state hoist.
+    """
+    sdfg = dace.SDFG("written_bound")
+    sdfg.add_array("A", [DIM_SIZE], dace.float64)
+    sdfg.add_scalar("base", dace.int64)
+    sdfg.add_scalar("bnd_val", dace.int64, transient=True)
+    sdfg.add_symbol("bound", dace.int64)
+    state = sdfg.add_state("main")
+
+    base = state.add_read("base")
+    bnd = state.add_access("bnd_val")
+    mk = state.add_tasklet("mkbound", {"b"}, {"o"}, "o = b + 5")
+    state.add_edge(base, None, mk, "b", dace.Memlet("base[0]"))
+    state.add_edge(mk, "o", bnd, None, dace.Memlet("bnd_val[0]"))
+
+    a = state.add_write("A")
+    me, mx = state.add_map("m", {"i": "0:bound:1"})
+    zero = state.add_tasklet("zero", {}, {"o"}, "o = 0.0")
+    state.add_edge(me, None, zero, None, dace.Memlet())
+    state.add_edge(zero, "o", mx, "IN_A", dace.Memlet("A[i]"))
+    state.add_edge(mx, "OUT_A", a, None, dace.Memlet("A[0:bound]"))
+    mx.add_in_connector("IN_A")
+    mx.add_out_connector("OUT_A")
+    state.add_edge(bnd, None, me, "bound", dace.Memlet("bnd_val[0]"))
+    me.add_in_connector("bound")
+    return sdfg
+
+
+@pytest.mark.parametrize("expansion_type", EXPANSION_TYPES)
+@temporarily_disable_autoopt_and_serialization
+def test_dynamic_bound_written_in_state_uses_nesting(expansion_type, xp):
+    """A bound scalar written in the map's own state forces the nested-SDFG fallback."""
+    sdfg = _prepare_sdfg(_build_in_state_written_bound_sdfg(), expansion_type, "nest")
+
+    AssignmentAndCopyKernelToMemsetAndMemcpy(overapproximate_first_dimensions=False).apply_pass(sdfg, {})
+    assert _get_num_memset_library_nodes(sdfg) == 1
+    assert _get_num_nested_sdfgs(sdfg) == 1, "an in-state-written bound must be isolated in a nested SDFG"
+
+    A_IN = xp.ones(DIM_SIZE)
+    _expand_and_validate(sdfg, expansion_type)
+    sdfg(A=A_IN, base=4)  # bound = 9
+    expected = xp.ones(DIM_SIZE)
+    expected[0:9] = 0.0
+    assert xp.allclose(A_IN, expected)
+
+
+@pytest.mark.parametrize("expansion_type", EXPANSION_TYPES)
+@temporarily_disable_autoopt_and_serialization
+def test_dynamic_bound_contiguity_per_overapprox(expansion_type, xp):
+    """Without overapprox only the contiguous (1D) dynamic memset lifts; the 2D partial-inner one is
+    non-contiguous and is left alone until overapprox widens its stride-1 dim to the full extent."""
+    sdfg = _prepare_sdfg(_sdfg_from_program(double_memset_with_dynamic_connectors), expansion_type, "contig")
+
+    AssignmentAndCopyKernelToMemsetAndMemcpy(overapproximate_first_dimensions=False).apply_pass(sdfg, {})
+    assert _get_num_memset_library_nodes(sdfg) == 1
+    AssignmentAndCopyKernelToMemsetAndMemcpy(overapproximate_first_dimensions=True).apply_pass(sdfg, {})
+    assert _get_num_memset_library_nodes(sdfg) == 2
+
+    A_IN = xp.ones((DIM_SIZE, DIM_SIZE))
+    B_IN = xp.ones(DIM_SIZE)
+    _expand_and_validate(sdfg, expansion_type)
+    sdfg(llindex3=A_IN, zsinksum=B_IN, D=DIM_SIZE, kfdia=DIM_SIZE, kidia=1)
+    assert xp.all(A_IN == 0.0)
+    assert xp.all(B_IN == 0.0)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
-# Copyright 2019-2025 ETH Zurich and the DaCe authors. All rights reserved.
+# Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
+"""Scope-emission strategies (RAII bracket managers) for the experimental CUDA codegen."""
 from abc import ABC, abstractmethod
 
 from dace import dtypes, subsets, symbolic
@@ -10,21 +11,20 @@ from dace.codegen.dispatcher import DefinedType, TargetDispatcher
 from dace.transformation import helpers
 from dace.codegen.targets.cpp import sym2cpp
 from dace.codegen.targets.experimental_cuda import ExperimentalCUDACodeGen, KernelSpec
-from dace.codegen.targets.experimental_cuda_helpers.gpu_utils import (get_cuda_dim, product)
-
-#----------------------------------------------------------------------------------
-# GPU Scope Generation Strategies
-#----------------------------------------------------------------------------------
+from dace.codegen.targets.experimental_cuda_helpers.gpu_utils import get_cuda_dim
+from dace.transformation.dataflow.add_threadblock_map import product
 
 
 def _emit_dim_index_definitions(scope_map, axis: str, ctype: str, callsite_stream: CodeIOStream, cfg: ControlFlowRegion,
                                 state_id: int, anchor_node, dispatcher: TargetDispatcher):
-    """Emit ``{ctype} {var_name} = {expr};`` per map dim using the symbolic-
-    coordinate substitution. ``axis`` is ``'blockIdx'`` (kernel scope) or
-    ``'threadIdx'`` (thread-block scope). First three dims map directly to
-    ``axis.{x|y|z}``; further dims delinearize off ``axis.z``. Returns
-    ``(map_range, sym_indices, sym_coords)`` for callers that need the
-    symbolic forms downstream (e.g. for guard conditions)."""
+    """Emit ``{ctype} {var_name} = {expr};`` per map dim using the symbolic-coordinate substitution.
+
+    ``axis`` is ``'blockIdx'`` (kernel scope) or ``'threadIdx'`` (thread-block scope). The first
+    three dims map directly to ``axis.{x|y|z}``; further dims delinearize off ``axis.z``.
+
+    :returns: ``(map_range, sym_indices, sym_coords)`` for callers that need the symbolic forms
+              downstream (e.g. for guard conditions).
+    """
     map_range = subsets.Range(scope_map.range[::-1])  # reversed for memory coalescing
     dimensions = len(map_range)
     dim_sizes = map_range.size()
@@ -72,7 +72,7 @@ class ScopeGenerationStrategy(ABC):
 
     @abstractmethod
     def generate(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg_scope: ScopeSubgraphView, state_id: int,
-                 function_stream: CodeIOStream, callsite_stream: CodeIOStream) -> None:
+                 function_stream: CodeIOStream, callsite_stream: CodeIOStream):
         raise NotImplementedError('Abstract class')
 
     def _dispatch_and_deallocate(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg_scope: ScopeSubgraphView, state_id: int,
@@ -109,13 +109,11 @@ class KernelScopeGenerator(ScopeGenerationStrategy):
                           callsite_stream=callsite_stream,
                           comment=self.SCOPE_COMMENT) as scope_manager:
 
-            # ----------------- Retrieve kernel configuration -----------------------
-
             kernel_spec = self._current_kernel_spec
             kernel_entry_node = kernel_spec.kernel_map_entry  # == dfg_scope.source_nodes()[0]
 
             # Without an inner ThreadBlock map the kernel-map variables bind
-            # to thread indices instead — same blockIdx-based formulas.
+            # to thread indices instead -- same blockIdx-based formulas.
             _emit_dim_index_definitions(kernel_spec.kernel_map, 'blockIdx', kernel_spec.gpu_index_ctype,
                                         callsite_stream, cfg, state_id, kernel_entry_node, self._dispatcher)
 
@@ -133,13 +131,16 @@ class KernelScopeGenerator(ScopeGenerationStrategy):
         node = dfg_scope.source_nodes()[0]
 
         # Conditionally add __launch_bounds__ for block size optimization.
+        min_warps_per_eu = ''
+        if node.gpu_min_warps_per_eu is not None and node.gpu_min_warps_per_eu > 0:
+            min_warps_per_eu = f',{node.gpu_min_warps_per_eu}'
         launch_bounds = ''
         if node.gpu_launch_bounds != '-1':
             if node.gpu_launch_bounds == "0":
                 if not any(symbolic.issymbolic(b) for b in block_dims):
-                    launch_bounds = f'__launch_bounds__({product(block_dims)})'
+                    launch_bounds = f'__launch_bounds__({product(block_dims)}{min_warps_per_eu})'
             else:
-                launch_bounds = f'__launch_bounds__({node.gpu_launch_bounds})'
+                launch_bounds = f'__launch_bounds__({node.gpu_launch_bounds}{min_warps_per_eu})'
 
         # Emit kernel function signature
         callsite_stream.write(f'__global__ void {launch_bounds} {kernel_name}({", ".join(kernel_args)}) ', cfg,
@@ -178,17 +179,12 @@ class ThreadBlockScopeGenerator(ScopeGenerationStrategy):
 
             self.codegen._frame.allocate_arrays_in_scope(sdfg, cfg, node, function_stream, callsite_stream)
 
-            # ----------------- Guard Conditions for Block Execution -----------------------
-
-            # Generate conditions for this block's execution using min and max
-            # element, e.g. skipping out-of-bounds threads in trailing block
+            # Guard each dim so out-of-bounds threads in a trailing block are skipped.
             minels = map_range.min_element()
             maxels = map_range.max_element()
             for dim, (var_name, start, end) in enumerate(zip(scope_map.params[::-1], minels, maxels)):
 
                 # Optimize conditions if they are always true
-                #############################################
-
                 condition = ''
 
                 # Block range start
@@ -243,22 +239,18 @@ class WarpScopeGenerator(ScopeGenerationStrategy):
             map_range = subsets.Range(scope_map.range[::-1])  # Reversed for potential better performance
             warp_dim = len(map_range)
 
-            # The following sizes and bounds are be symbolic
+            # These sizes and bounds may be symbolic.
             num_threads_in_block = product(block_dims)
             warp_dim_bounds = [max_elem + 1 for max_elem in map_range.max_element()]
             num_warps = product(warp_dim_bounds)
 
-            # The C type used to define the (flat) threadId and warpId variables
+            # The C type that defines the (flat) threadId and warpId variables
             ids_ctype = kernel_spec.gpu_index_ctype
 
-            # ----------------- Guard checks -----------------------
-
-            # handles checks either at compile time or runtime (i.e. checks in the generated code)
             self._handle_GPU_Warp_scope_guards(state_dfg, node, map_range, warp_dim, num_threads_in_block, num_warps,
                                                callsite_stream, scope_manager)
 
-            # ----------------- Define (flat) Thread ID within Block -----------------------
-
+            # Define the flat thread ID within the block.
             flattened_terms = []
 
             for i, dim_size in enumerate(block_dims):
@@ -281,8 +273,7 @@ class WarpScopeGenerator(ScopeGenerationStrategy):
                                   state_id, node)
             self._dispatcher.defined_vars.add(threadID_name, DefinedType.Scalar, ids_ctype)
 
-            # ----------------- Compute Map indices (= Warp indices) -----------------------
-
+            # Compute the map indices (the warp indices).
             for i in range(warp_dim):
                 var_name = scope_map.params[-i - 1]  # reverse order
                 previous_sizes = warp_dim_bounds[:i]
@@ -298,8 +289,7 @@ class WarpScopeGenerator(ScopeGenerationStrategy):
 
             self.codegen._frame.allocate_arrays_in_scope(sdfg, cfg, node, function_stream, callsite_stream)
 
-            # ----------------- Guard Conditions for Warp Execution -----------------------
-
+            # Guard conditions for warp execution.
             if num_warps * warpSize != num_threads_in_block:
                 condition = f'{threadID_name} < {num_warps}'
                 scope_manager.open(condition)
@@ -326,8 +316,6 @@ class WarpScopeGenerator(ScopeGenerationStrategy):
     def _handle_GPU_Warp_scope_guards(self, state_dfg: SDFGState, node: nodes.MapEntry, map_range: subsets.Range,
                                       warp_dim: int, num_threads_in_block, num_warps, kernel_stream: CodeIOStream,
                                       scope_manager: 'ScopeManager'):
-
-        #TODO: Move them to sdfg validation as well if possible
 
         # Get warpSize from the kernel specification
         warpSize = self._current_kernel_spec.warpSize
@@ -384,17 +372,10 @@ class WarpScopeGenerator(ScopeGenerationStrategy):
                 raise ValueError(f"Warp ID value {min_element} must be non-negative.")
 
 
-#----------------------------------------------------------------------------------
-# Scope Manager, handling brackets and allocation/deallocation of arrays in Scopes
-#----------------------------------------------------------------------------------
-
-
 class ScopeManager:
-    """
-    A helper class to manage opening and closing brackets in a structured way using the 'with' statement.
-    This class simplifies the process of correctly opening and closing brackets. It also supports an optional
-    debug mode to include comments in the generated code, which can help with debugging and understanding
-    the code structure.
+    """RAII context manager that balances ``{`` / ``}`` for a generated scope.
+
+    Optional ``debug`` mode annotates each bracket with ``comment`` for readability.
     """
 
     def __init__(self,
@@ -408,19 +389,12 @@ class ScopeManager:
                  comment: str = None,
                  brackets_on_enter: bool = True,
                  debug: bool = False):
-        """
-        Initializes the KernelScopeManager.
+        """Initialize the scope manager.
 
-        :param frame_codegen: The frame codegenerator used for allocation and deallocation of arrays in scopes
-        :param sdfg: The SDFG instance for context.
-        :param cfg: The ControlFlowRegion instance for context.
-        :param dfg_scope: The ScopeSubgraphView instance for context.
-        :param state_id: The ID of the current state for context.
-        :param function_stream: The CodeIOStream for function-level code.
-        :param callsite_stream: The CodeIOStream for callsite-level code.
-        :param comment: A descriptive comment explaining the purpose of the code block being opened. Default is None.
-        :param brackets_on_enter: Whether on entering (i.e. when using "with", there should be a bracket opened). Default is True.
-        :param debug: Whether to include debug comments in the output. Defaults to False.
+        :param frame_codegen: frame codegen used for in-scope array (de)allocation.
+        :param comment: label describing the opened block, used by ``debug`` mode.
+        :param brackets_on_enter: open a bracket on ``__enter__``.
+        :param debug: annotate brackets with ``comment``.
         """
         self.frame_codegen = frame_codegen
         self.sdfg = sdfg
@@ -438,18 +412,13 @@ class ScopeManager:
         self.exit_node = self.dfg_scope.sink_nodes()[0]
 
     def __enter__(self):
-        """
-        Writes the opening bracket in case self.brackets_on_enter
-        is set to true, which it is by default.
-        """
+        """Open a bracket when ``brackets_on_enter`` is set (the default)."""
         if self.brackets_on_enter:
             self.open()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        """
-        Writes the closing brackets to the stream.
-        """
+        """Write the closing bracket for every bracket opened by this manager."""
         for i in range(self._opened):
             line = "}"
             if self.debug:
@@ -457,11 +426,9 @@ class ScopeManager:
             self.callsite_stream.write(line, self.cfg, self.state_id, self.exit_node)
 
     def open(self, condition: str = None):
-        """
-        Opens a bracket. If a condition is given, emits 'if (condition) {', otherwise just '{'.
-        Tracks the number of open brackets for closing later.
+        """Open a bracket, emitting ``if (condition) {`` when ``condition`` is given else ``{``.
 
-        :param condition: Optional condition for the opening bracket.
+        :param condition: optional guard condition for the opening bracket.
         """
         line = f"if ({condition}) {{" if condition else "{"
         if self.debug:

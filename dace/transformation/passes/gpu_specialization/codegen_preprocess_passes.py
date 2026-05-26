@@ -1,12 +1,6 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
-"""Wrapper :class:`Pass` classes that turn previously-imperative steps in
-``experimental_cuda.preprocess`` into composable Pipeline members.
-
-Each pass corresponds to one of the manual operations the codegen target
-used to call directly (``sdfg.expand_library_nodes``,
-``apply_transformations_once_everywhere(AddThreadBlockMap)``, etc.) and
-exposes the same behaviour through the Pipeline framework so the order
-becomes declarative and testable.
+"""Wrapper :class:`Pass` classes exposing the ``experimental_cuda.preprocess`` steps as composable
+Pipeline members, so codegen-preprocess ordering is declarative and testable.
 """
 from typing import Any, Dict, Optional
 
@@ -17,12 +11,7 @@ from dace.transformation import pass_pipeline as ppl, transformation
 @properties.make_properties
 @transformation.explicit_cf_compatible
 class ExpandLibraryNodes(ppl.Pass):
-    """Wraps :meth:`SDFG.expand_library_nodes` (recursive) as a Pipeline
-    Pass so library-node expansion can be ordered declaratively
-    alongside other transformations."""
-
-    def depends_on(self):
-        return set()
+    """Recursive :meth:`SDFG.expand_library_nodes` as a Pipeline Pass."""
 
     def modifies(self) -> ppl.Modifies:
         return (ppl.Modifies.States | ppl.Modifies.Nodes | ppl.Modifies.Edges | ppl.Modifies.Descriptors
@@ -43,24 +32,13 @@ class ExpandLibraryNodes(ppl.Pass):
 @properties.make_properties
 @transformation.explicit_cf_compatible
 class AddThreadBlockMaps(ppl.Pass):
-    """Tile every ``GPU_Device`` map without an inner ``GPU_ThreadBlock``
-    map (via :class:`AddThreadBlockMap`) and infer the resulting
-    ``(grid, block)`` dimensions for codegen.
+    """Tile every ``GPU_Device`` map lacking an inner ``GPU_ThreadBlock`` map (via
+    :class:`AddThreadBlockMap`) and infer the resulting ``(grid, block)`` dimensions.
 
-    Returns a dict ``{'kernel_dimensions_map': …, 'tb_inserted_kernels':
-    set(MapEntry)}`` that callers (the codegen target) read out of
-    ``pipeline_results``.
-
-    Tiles late on purpose: the kernel-internal transient hoist
-    (``MoveArrayOutOfKernel``) sees user-authored kernel shapes, not
-    post-tile shapes — tiling earlier introduces an inner-map range like
-    ``Min(N-1, b_i+31) - b_i + 1`` whose ``b_i`` outer-loop symbol then
-    leaks into host-side ``cudaMalloc`` size expressions for any
-    transient lifted out of the kernel.
+    Returns ``{'kernel_dimensions_map': ..., 'tb_inserted_kernels': set(MapEntry)}`` in
+    ``pipeline_results``. Tiled late on purpose: tiling first leaks the inner-map outer-loop
+    symbol into host-side ``cudaMalloc`` size expressions for kernel-hoisted transients.
     """
-
-    def depends_on(self):
-        return set()
 
     def modifies(self) -> ppl.Modifies:
         return ppl.Modifies.States | ppl.Modifies.Nodes | ppl.Modifies.Edges
@@ -88,17 +66,13 @@ class AddThreadBlockMaps(ppl.Pass):
 
 @properties.make_properties
 @transformation.explicit_cf_compatible
-class InvalidateAndInferConnectorTypes(ppl.Pass):
-    """Reset stale Array-vs-Scalar connector typings on NestedSDFGs (some
-    are spawned by library expansion with construction-time typing that
-    no longer matches the inner descriptor) and re-infer per sub-SDFG.
+class ReinferConnectorTypes(ppl.Pass):
+    """Clear and re-derive NestedSDFG connector types from their inner descriptors.
 
-    ``infer_connector_types`` only walks top-level states, so we iterate
-    every nested SDFG explicitly.
+    Earlier passes mutate descriptors (e.g. ``PromoteGPUScalarsToArrays`` widens a ``Scalar`` to a
+    length-1 ``Array``), leaving stale scalar-typed connectors that miscompile (``T name`` vs.
+    ``name[0]``). Re-inference makes them pointer-typed.
     """
-
-    def depends_on(self):
-        return set()
 
     def modifies(self) -> ppl.Modifies:
         return ppl.Modifies.Connectors | ppl.Modifies.Descriptors
@@ -106,7 +80,7 @@ class InvalidateAndInferConnectorTypes(ppl.Pass):
     def should_reapply(self, modified: ppl.Modifies) -> bool:
         return False
 
-    def apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any]) -> None:
+    def apply_pass(self, sdfg: SDFG, pipeline_results: Dict[str, Any]):
         from dace.sdfg import infer_types
         from dace.transformation.passes.promote_gpu_scalars_to_arrays import invalidate_array_connectors
         invalidate_array_connectors(sdfg)

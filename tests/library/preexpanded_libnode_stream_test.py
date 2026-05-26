@@ -1,24 +1,6 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
-"""Tests for pre-expanded GPU runtime tasklets in the stream pipeline.
-
-Some callers expand library nodes manually before calling ``compile()``
-(e.g. to inspect the lowered SDFG). The stream pipeline must still treat
-the resulting ``cudaMemcpyAsync`` / ``cudaMemsetAsync`` tasklets as
-stream consumers — otherwise their assigned stream silently defaults to
-0 and no synchronization is emitted.
-
-These tests pin the contract:
-
-1. Pre-expanded ``CopyLibraryNode`` Tasklets receive a ``stream``
-   in-connector wired to ``gpu_streams[<i>]``, just like the unexpanded
-   libnodes would.
-2. The naive sync classifier emits ``cudaStreamSynchronize`` after them.
-3. The monolithic single-stream strategy accepts pre-expanded SDFGs and
-   emits the expected number of host-boundary syncs.
-4. The legacy ``__dace_current_stream`` codegen prelude raises if a
-   Tasklet references the symbol without a wired stream connector — the
-   silent-fallback bug it hid in the past.
-"""
+"""The stream pipeline treats pre-expanded ``cudaMemcpyAsync`` / ``cudaMemsetAsync`` tasklets as
+stream consumers (connectors wired, syncs emitted, monolithic strategy accepting)."""
 import pytest
 
 import dace
@@ -26,8 +8,7 @@ from dace.codegen import common
 from dace.libraries.standard.nodes.copy_node import CopyLibraryNode
 from dace.transformation.passes.gpu_specialization.gpu_specialization_pipeline import GPUStreamPipeline
 from dace.transformation.passes.gpu_specialization.gpu_stream_scheduling import MonolithicSingleStreamGPUScheduler
-from dace.transformation.passes.gpu_specialization.helpers.gpu_helpers import (COPY_MEMSET_STREAM_CONNECTOR,
-                                                                               has_stream_connector,
+from dace.transformation.passes.gpu_specialization.helpers.gpu_helpers import (STREAM_CONNECTOR, has_stream_connector,
                                                                                is_already_lowered_gpu_runtime_call)
 
 
@@ -48,10 +29,10 @@ def _build_h2d_d2h_pre_expanded_sdfg():
     d2h = CopyLibraryNode(name='copy_d2h')
     d2h.implementation = 'MemcpyCUDA1D'
     state.add_node(d2h)
-    state.add_edge(a, None, h2d, '_cpy_in', dace.Memlet('host_in[0:16]'))
-    state.add_edge(h2d, '_cpy_out', d, None, dace.Memlet('dev[0:16]'))
-    state.add_edge(d, None, d2h, '_cpy_in', dace.Memlet('dev[0:16]'))
-    state.add_edge(d2h, '_cpy_out', b, None, dace.Memlet('host_out[0:16]'))
+    state.add_edge(a, None, h2d, CopyLibraryNode.INPUT_CONNECTOR_NAME, dace.Memlet('host_in[0:16]'))
+    state.add_edge(h2d, CopyLibraryNode.OUTPUT_CONNECTOR_NAME, d, None, dace.Memlet('dev[0:16]'))
+    state.add_edge(d, None, d2h, CopyLibraryNode.INPUT_CONNECTOR_NAME, dace.Memlet('dev[0:16]'))
+    state.add_edge(d2h, CopyLibraryNode.OUTPUT_CONNECTOR_NAME, b, None, dace.Memlet('host_out[0:16]'))
 
     sdfg.expand_library_nodes()
     return sdfg
@@ -72,8 +53,7 @@ def _sync_tasklets(sdfg):
 @pytest.mark.gpu
 @pytest.mark.new_gpu_codegen_only
 def test_naive_strategy_wires_stream_connector_on_pre_expanded_tasklet():
-    """The naive strategy must recognize pre-expanded ``cudaMemcpyAsync``
-    Tasklets as stream consumers and wire a ``stream`` in-connector to each."""
+    """Naive strategy wires a ``stream`` in-connector on each pre-expanded ``cudaMemcpyAsync`` tasklet."""
     sdfg = _build_h2d_d2h_pre_expanded_sdfg()
     runtime_calls = _runtime_tasklets(sdfg)
     assert len(runtime_calls) == 2
@@ -84,14 +64,13 @@ def test_naive_strategy_wires_stream_connector_on_pre_expanded_tasklet():
         assert has_stream_connector(tasklet), (
             f"Pre-expanded tasklet '{tasklet.label}' must have a stream in-connector "
             f"after the pipeline runs.")
-        assert COPY_MEMSET_STREAM_CONNECTOR in tasklet.in_connectors
+        assert STREAM_CONNECTOR in tasklet.in_connectors
 
 
 @pytest.mark.gpu
 @pytest.mark.new_gpu_codegen_only
 def test_naive_strategy_emits_state_end_sync_for_pre_expanded_tasklets():
-    """Naive strategy must emit a ``cudaStreamSynchronize`` after the
-    runtime tasklets so the host doesn't race with their async work."""
+    """Naive strategy emits a ``cudaStreamSynchronize`` after the pre-expanded runtime tasklets."""
     sdfg = _build_h2d_d2h_pre_expanded_sdfg()
     GPUStreamPipeline().apply_pass(sdfg, {})
 
@@ -102,9 +81,7 @@ def test_naive_strategy_emits_state_end_sync_for_pre_expanded_tasklets():
 @pytest.mark.gpu
 @pytest.mark.new_gpu_codegen_only
 def test_monolithic_strategy_accepts_pre_expanded_sdfg():
-    """Monolithic strategy must accept a pre-expanded SDFG (host-level
-    cudaMemcpyAsync tasklets are recognized as stream consumers, not
-    rejected by the all-on-GPU validator)."""
+    """Monolithic strategy accepts a pre-expanded SDFG (host-level copy tasklets pass the validator)."""
     sdfg = _build_h2d_d2h_pre_expanded_sdfg()
     GPUStreamPipeline(scheduling_strategy=MonolithicSingleStreamGPUScheduler()).apply_pass(sdfg, {})
 
@@ -114,12 +91,7 @@ def test_monolithic_strategy_accepts_pre_expanded_sdfg():
 
 
 def test_pipeline_wires_connector_for_pre_expanded_runtime_tasklet():
-    """The pipeline must wire a ``__stream`` connector onto every
-    pre-expanded GPU runtime tasklet. The codegen prelude binds
-    ``__dace_current_stream`` from that connector — so a tasklet using
-    the legacy symbol without a wired connector would generate
-    ill-formed C++. We verify the connector is present after the
-    pipeline, which is what makes the codegen prelude work."""
+    """Pipeline wires a ``gpuStream_t`` in-connector onto every pre-expanded runtime tasklet."""
     sdfg = _build_h2d_d2h_pre_expanded_sdfg()
     GPUStreamPipeline().apply_pass(sdfg, {})
     for tasklet, _ in _runtime_tasklets(sdfg):

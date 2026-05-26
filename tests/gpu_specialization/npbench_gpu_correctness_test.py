@@ -1,21 +1,7 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
-"""
-Numerical-validation matrix for NPBench kernels through the new GPU pipeline.
-
-For each kernel:
-  1. Build a CPU SDFG and run it (reference).
-  2. Build a fresh SDFG, apply ``apply_gpu_transformations()``, then run the
-     explicit GPU stream-management pipeline (``InsertExplicitGPUGlobalMemoryCopies``
-     -> stream scheduling/insertion/connection -> sync tasklets), and compile
-     with the new GPU codegen.
-  3. Run the GPU SDFG on independent copies of the inputs and compare to the
-     CPU result element-wise.
-
-Failure modes are surfaced as test failures with the kernel name, plus the
-type of failure (compile vs numerical) so the report is easy to read.
-"""
+"""NPBench kernels through the new GPU stream pipeline compared element-wise against the CPU SDFG."""
+import importlib.util
 import os
-import sys
 from typing import Callable, Dict
 
 import numpy as np
@@ -28,50 +14,52 @@ from dace.transformation.passes.gpu_specialization.gpu_stream_scheduling import 
 from dace.transformation.passes.gpu_specialization.insert_explicit_gpu_global_memory_copies import (
     InsertExplicitGPUGlobalMemoryCopies, )
 
-# Make the existing polybench / NPBench kernel modules importable.
-_TESTS_DIR = os.path.abspath(os.path.dirname(__file__))
-_REPO_DIR = os.path.abspath(os.path.join(_TESTS_DIR, os.pardir))
-for sub in ('npbench/polybench', 'npbench/misc', 'npbench/weather_stencils'):
-    p = os.path.join(_REPO_DIR, sub)
-    if p not in sys.path:
-        sys.path.insert(0, p)
+# Load the existing polybench / NPBench kernel-test modules by path (no ``sys.path`` mutation).
+_NPBENCH_DIR = os.path.join(os.path.dirname(__file__), os.pardir, "npbench")
 
-# Polybench (already in this branch).
-import adi_test  # noqa: E402
-import atax_test  # noqa: E402
-import bicg_test  # noqa: E402
-import correlation_test  # noqa: E402
-import covariance_test  # noqa: E402
-import deriche_test  # noqa: E402
-import doitgen_test  # noqa: E402
-import durbin_test  # noqa: E402
-import fdtd_2d_test  # noqa: E402
-import floyd_warshall_test  # noqa: E402
-import gemm_npbench_test  # noqa: E402
-import gemver_test  # noqa: E402
-import gesummv_test  # noqa: E402
-import gramschmidt_test  # noqa: E402
-import heat_3d_test  # noqa: E402
-import jacobi_1d_test  # noqa: E402
-import jacobi_2d_test  # noqa: E402
-import k2mm_test  # noqa: E402
-import k3mm_test  # noqa: E402
-import lu_test  # noqa: E402
-import ludcmp_test  # noqa: E402
-import mvt_test  # noqa: E402
-import nussinov_test  # noqa: E402
-import seidel_2d_test  # noqa: E402
-import symm_test  # noqa: E402
-import syr2k_test  # noqa: E402
-import syrk_test  # noqa: E402
-import trisolv_test  # noqa: E402
-import trmm_test  # noqa: E402
 
-# NPBench misc / weather (added as part of this PR).
-import cavity_flow_test  # noqa: E402
-import channel_flow_test  # noqa: E402
-import hdiff_test  # noqa: E402
-import vadv_test  # noqa: E402
+def _kernel_module(subdir, name):
+    """Load an npbench kernel-test module from ``npbench/<subdir>/<name>.py``."""
+    spec = importlib.util.spec_from_file_location(name, os.path.join(_NPBENCH_DIR, subdir, f"{name}.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+adi_test = _kernel_module("polybench", "adi_test")
+atax_test = _kernel_module("polybench", "atax_test")
+bicg_test = _kernel_module("polybench", "bicg_test")
+correlation_test = _kernel_module("polybench", "correlation_test")
+covariance_test = _kernel_module("polybench", "covariance_test")
+deriche_test = _kernel_module("polybench", "deriche_test")
+doitgen_test = _kernel_module("polybench", "doitgen_test")
+durbin_test = _kernel_module("polybench", "durbin_test")
+fdtd_2d_test = _kernel_module("polybench", "fdtd_2d_test")
+floyd_warshall_test = _kernel_module("polybench", "floyd_warshall_test")
+gemm_npbench_test = _kernel_module("polybench", "gemm_npbench_test")
+gemver_test = _kernel_module("polybench", "gemver_test")
+gesummv_test = _kernel_module("polybench", "gesummv_test")
+gramschmidt_test = _kernel_module("polybench", "gramschmidt_test")
+heat_3d_test = _kernel_module("polybench", "heat_3d_test")
+jacobi_1d_test = _kernel_module("polybench", "jacobi_1d_test")
+jacobi_2d_test = _kernel_module("polybench", "jacobi_2d_test")
+k2mm_test = _kernel_module("polybench", "k2mm_test")
+k3mm_test = _kernel_module("polybench", "k3mm_test")
+lu_test = _kernel_module("polybench", "lu_test")
+ludcmp_test = _kernel_module("polybench", "ludcmp_test")
+mvt_test = _kernel_module("polybench", "mvt_test")
+nussinov_test = _kernel_module("polybench", "nussinov_test")
+seidel_2d_test = _kernel_module("polybench", "seidel_2d_test")
+symm_test = _kernel_module("polybench", "symm_test")
+syr2k_test = _kernel_module("polybench", "syr2k_test")
+syrk_test = _kernel_module("polybench", "syrk_test")
+trisolv_test = _kernel_module("polybench", "trisolv_test")
+trmm_test = _kernel_module("polybench", "trmm_test")
+
+cavity_flow_test = _kernel_module("misc", "cavity_flow_test")
+channel_flow_test = _kernel_module("misc", "channel_flow_test")
+hdiff_test = _kernel_module("weather_stencils", "hdiff_test")
+vadv_test = _kernel_module("weather_stencils", "vadv_test")
 
 _GPU_STREAM_PIPELINE = Pipeline([
     InsertExplicitGPUGlobalMemoryCopies(),
@@ -81,14 +69,14 @@ _GPU_STREAM_PIPELINE = Pipeline([
 _TSTEPS_SMALL = 3
 
 
-def _compare_arrays(cpu_args: Dict[str, np.ndarray], gpu_args: Dict[str, np.ndarray], rtol: float, atol: float) -> None:
+def _compare_arrays(cpu_args: Dict[str, np.ndarray], gpu_args: Dict[str, np.ndarray], rtol: float, atol: float):
     for name, cpu_val in cpu_args.items():
         if not isinstance(cpu_val, np.ndarray):
             continue
         np.testing.assert_allclose(gpu_args[name], cpu_val, rtol=rtol, atol=atol, err_msg=f'arg "{name}" mismatch')
 
 
-def _compare_returns(cpu_ret, gpu_ret, rtol: float, atol: float) -> None:
+def _compare_returns(cpu_ret, gpu_ret, rtol: float, atol: float):
     if cpu_ret is None:
         return
     if isinstance(cpu_ret, tuple):
@@ -103,10 +91,8 @@ def _run_through_new_gpu_pipeline(kernel,
                                   symbols: Dict[str, int],
                                   *,
                                   rtol: float = 1e-10,
-                                  atol: float = 1e-12) -> None:
-    """Build CPU and new-pipeline GPU SDFGs, run both, compare. Compilation
-    failures and numerical mismatches surface as ``pytest.fail`` with a tag
-    so the matrix output classifies them at a glance."""
+                                  atol: float = 1e-12):
+    """Run ``kernel`` on a CPU SDFG and a GPU-transformed SDFG and assert the outputs match."""
     cpu_sdfg = kernel.to_sdfg(simplify=True)
     cpu_args = build_args()
     cpu_ret = cpu_sdfg(**cpu_args, **symbols)
@@ -114,12 +100,8 @@ def _run_through_new_gpu_pipeline(kernel,
     gpu_sdfg = kernel.to_sdfg(simplify=True)
     gpu_sdfg.apply_gpu_transformations()
 
-    # ``ExperimentalCUDACodeGen.preprocess`` runs the explicit-stream-management
-    # pipeline (``InsertExplicitGPUGlobalMemoryCopies`` -> stream scheduling /
-    # insertion / connection -> sync tasklets) itself. Pre-applying it here
-    # double-applies stream wiring, which corrupts the per-stream chains and
-    # produces runtime memory faults. Hand the SDFG to ``compile()`` raw and
-    # let preprocess do the lowering once.
+    # ``ExperimentalCUDACodeGen.preprocess`` runs the stream pipeline itself; pre-applying it here
+    # would double-wire the per-stream chains and fault at runtime.
 
     try:
         compiled = gpu_sdfg.compile()
@@ -137,9 +119,6 @@ def _run_through_new_gpu_pipeline(kernel,
         _compare_returns(cpu_ret, gpu_ret, rtol, atol)
     except AssertionError as e:
         pytest.fail(f'NUMERICAL_FAIL: {e}', pytrace=False)
-
-
-# --- Polybench kernel cases -----------------------------------------------------
 
 
 @pytest.mark.gpu
@@ -402,12 +381,9 @@ def test_fdtd_2d():
                                   atol=1e-6)
 
 
-# --- NPBench misc / weather kernels (newly ported) -----------------------------
-
-
 @pytest.mark.gpu
 def test_cavity_flow():
-    """Lid-driven cavity flow (NPBench misc), a small Navier-Stokes solver."""
+    """The cavity-flow kernel's GPU SDFG matches the CPU SDFG element-wise."""
     ny, nx, nt, nit, rho, nu = 21, 21, 4, 5, 1.0, 0.1
     u, v, p, dx, dy, dt = cavity_flow_test.initialize(ny, nx)
     build_args = lambda: dict(nt=nt, nit=nit, u=u.copy(), v=v.copy(), dt=dt, dx=dx, dy=dy, p=p.copy(), rho=rho, nu=nu)
@@ -420,7 +396,7 @@ def test_cavity_flow():
 
 @pytest.mark.gpu
 def test_channel_flow():
-    """Channel flow with periodic BC (NPBench misc)."""
+    """The channel-flow kernel's GPU SDFG matches the CPU SDFG element-wise."""
     ny, nx, nit, rho, nu, F = 21, 21, 5, 1.0, 0.1, 1.0
     u, v, p, dx, dy, dt = channel_flow_test.initialize(ny, nx)
     build_args = lambda: dict(nit=nit, u=u.copy(), v=v.copy(), dt=dt, dx=dx, dy=dy, p=p.copy(), rho=rho, nu=nu, F=F)
@@ -433,7 +409,7 @@ def test_channel_flow():
 
 @pytest.mark.gpu
 def test_hdiff():
-    """Horizontal diffusion stencil (NPBench weather)."""
+    """The hdiff stencil kernel's GPU SDFG matches the CPU SDFG element-wise."""
     I, J, K = 16, 16, 8
     in_field, out_field, coeff = hdiff_test.initialize(I, J, K)
     build_args = lambda: dict(in_field=in_field.copy(), out_field=out_field.copy(), coeff=coeff.copy())
@@ -442,7 +418,7 @@ def test_hdiff():
 
 @pytest.mark.gpu
 def test_vadv():
-    """Vertical advection stencil (NPBench weather)."""
+    """The vadv stencil kernel's GPU SDFG matches the CPU SDFG element-wise."""
     I, J, K = 16, 16, 8
     dtr_stage, utens_stage, u_stage, wcon, u_pos, utens = vadv_test.initialize(I, J, K)
     build_args = lambda: dict(utens_stage=utens_stage.copy(),

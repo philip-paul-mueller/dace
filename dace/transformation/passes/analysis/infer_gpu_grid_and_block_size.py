@@ -1,43 +1,39 @@
-# Copyright 2019-2025 ETH Zurich and the DaCe authors. All rights reserved.
+# Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
+"""Analysis pass that infers CUDA grid and block dimensions for GPU device maps."""
 import warnings
 from typing import Dict, List, Set, Tuple
 
 import sympy
 
 from dace import SDFG, SDFGState, dtypes, symbolic
-from dace.codegen.targets.experimental_cuda_helpers import gpu_utils
 from dace.sdfg import nodes
 from dace.transformation import helpers, pass_pipeline as ppl
+from dace.transformation.dataflow.add_threadblock_map import to_3d_dims, validate_block_size_limits
 
 
 class InferGPUGridAndBlockSize(ppl.Pass):
     """
-    Infers the 3D CUDA launch configuration (grid and block sizes) for all GPU_Device map entries in the SDFG.
+    Infer the 3D CUDA launch configuration (grid and block sizes) for every ``GPU_Device`` map.
 
-    This pass assumes the `AddThreadBlockMap` transformation has already been applied, ensuring that each kernel
-    either has an explicit thread block map. However it is applicable as long as each GPU_Device scheduled map
-    has an inner explicit GPU_ThreadBlock scheduled map.
-
-    Block sizes are determined based on:
-    - Whether an explicit GPU_ThreadBlock map was inserted by `AddThreadBlockMap`. In this case,
-      the `gpu_block_size` attribute holds this information.
-    - Existing nested thread block maps and also the `gpu_block_size`, if present.
-
-    Grid sizes are computed from the kernel map's range, normalized to a 3D shape.
-
-    NOTE:
-        This pass does not handle dynamic parallelism (i.e., nested GPU_Device maps),
-        nor does it support GPU_ThreadBlock_Dynamic maps inside kernels. Behavior is unclear in
-        such cases.
+    Requires each kernel to have an inner explicit ``GPU_ThreadBlock`` map (normally inserted by
+    ``AddThreadBlockMap``). Block size comes from ``gpu_block_size`` or the nested thread-block maps;
+    grid size is the kernel range normalized to 3D. Nested ``GPU_Device`` maps and
+    ``GPU_ThreadBlock_Dynamic`` maps are not handled.
     """
 
     def apply_pass(self, sdfg: SDFG,
                    kernels_with_added_tb_maps: Set[nodes.MapEntry]) -> Dict[nodes.MapEntry, Tuple[List, List]]:
         """
-        Analyzes the given SDFG to determine the 3D grid and block sizes for all GPU_Device map entries.
+        Determine the 3D grid and block sizes for all ``GPU_Device`` map entries.
 
-        Returns:
-            A dictionary mapping each GPU_Device MapEntry node to a tuple (grid_dimensions, block_dimensions).
+        :param sdfg: the SDFG whose ``GPU_Device`` maps are configured.
+        :param kernels_with_added_tb_maps: kernel map entries whose thread-block map was inserted
+                                           by ``AddThreadBlockMap`` (their block size is read from
+                                           ``gpu_block_size`` rather than inferred).
+        :returns: a dict mapping each ``GPU_Device`` ``MapEntry`` to ``(grid_dimensions,
+                  block_dimensions)``.
+        :raises ValueError: if a kernel has neither a set ``gpu_block_size`` nor a nested
+                            ``GPU_ThreadBlock`` map, or if explicit and inferred block sizes conflict.
         """
         # Collect all GPU_Device map entries across the SDFG
         kernel_maps: Set[Tuple[
@@ -52,7 +48,7 @@ class InferGPUGridAndBlockSize(ppl.Pass):
         for map_entry, state in kernel_maps:
             # Compute grid size
             raw_grid = map_entry.map.range.size(True)[::-1]
-            grid_size = gpu_utils.to_3d_dims(raw_grid)
+            grid_size = to_3d_dims(raw_grid)
 
             # Compute Block size
             if map_entry in kernels_with_added_tb_maps:
@@ -60,19 +56,16 @@ class InferGPUGridAndBlockSize(ppl.Pass):
             else:
                 block_size = self._infer_gpu_block_size(state, map_entry)
 
-            block_size = gpu_utils.to_3d_dims(block_size)
-            gpu_utils.validate_block_size_limits(map_entry, block_size)
+            block_size = to_3d_dims(block_size)
+            validate_block_size_limits(map_entry, block_size)
 
             kernel_dimensions_map[map_entry] = (grid_size, block_size)
 
         return kernel_dimensions_map
 
     def _get_inserted_gpu_block_size(self, kernel_map_entry: nodes.MapEntry) -> List:
-        """
-        Returns the block size from a kernel map entry with an inserted thread-block map.
-
-        Assumes the `gpu_block_size` attribute is set by the AddThreadBlockMap transformation.
-        """
+        """Return the block size of a kernel whose thread-block map was inserted by ``AddThreadBlockMap``
+        (its ``gpu_block_size`` attribute is assumed set)."""
         gpu_block_size = kernel_map_entry.map.gpu_block_size
 
         if gpu_block_size is None:
@@ -82,24 +75,11 @@ class InferGPUGridAndBlockSize(ppl.Pass):
         return gpu_block_size
 
     def _infer_gpu_block_size(self, state: SDFGState, kernel_map_entry: nodes.MapEntry) -> List:
-        """
-        Infers the GPU block size for a kernel map entry based on nested GPU_ThreadBlock maps.
+        """Infer the GPU block size from nested ``GPU_ThreadBlock`` maps.
 
-        If the `gpu_block_size` attribute is set, it is assumed to be user-defined (not set by
-        a transformation like `AddThreadBlockMap`), and all nested thread-block maps must fit within it.
-        Otherwise, the block size is inferred by overapproximating the range sizes of all inner
-        GPU_ThreadBlock maps of kernel_map_entry.
-
-
-        Example:
-            for i in dace.map[0:N:32] @ GPU_Device:
-                for j in dace.map[0:32] @ GPU_ThreadBlock:
-                    ...
-                for l in dace.map[0:23] @ GPU_ThreadBlock:
-                    for k in dace.map[0:16] @ GPU_ThreadBlock:
-                        ...
-
-        Inferred GPU block size is [32, 1, 1]
+        A set ``gpu_block_size`` is treated as user-defined and all nested thread-block maps must fit
+        within it; otherwise the block size over-approximates the range sizes of all inner
+        ``GPU_ThreadBlock`` maps.
         """
         # Identify nested threadblock maps
         threadblock_maps = self._get_internal_threadblock_maps(state, kernel_map_entry)
@@ -118,7 +98,7 @@ class InferGPUGridAndBlockSize(ppl.Pass):
             # Over-approximate block size (e.g. min(N,(i+1)*32)-i*32 --> 32)
             # and collapse to GPU-compatible 3D dimensions
             tb_size = [symbolic.overapproximate(s) for s in tb_map.range.size()[::-1]]
-            tb_size = gpu_utils.to_3d_dims(tb_size)
+            tb_size = to_3d_dims(tb_size)
 
             if block_size is None:
                 block_size = tb_size
@@ -135,13 +115,13 @@ class InferGPUGridAndBlockSize(ppl.Pass):
             kernel_map_label = kernel_map_entry.map.label
 
             if kernel_map_entry.map.gpu_block_size is not None:
-                raise ValueError('Both the `gpu_block_size` property and internal thread-block '
+                raise ValueError('Both the ``gpu_block_size`` property and internal thread-block '
                                  'maps were defined with conflicting sizes for kernel '
                                  f'"{kernel_map_label}" (sizes detected: {detected_block_sizes}). '
-                                 'Use `gpu_block_size` only if you do not need access to individual '
+                                 'Use ``gpu_block_size`` only if you do not need access to individual '
                                  'thread-block threads, or explicit block-level synchronization (e.g., '
-                                 '`__syncthreads`). Otherwise, use internal maps with the `GPU_Threadblock` or '
-                                 '`GPU_ThreadBlock_Dynamic` schedules. For more information, see '
+                                 '``__syncthreads``). Otherwise, use internal maps with the ``GPU_Threadblock`` or '
+                                 '``GPU_ThreadBlock_Dynamic`` schedules. For more information, see '
                                  'https://spcldace.readthedocs.io/en/latest/optimization/gpu.html')
 
             else:
@@ -154,13 +134,7 @@ class InferGPUGridAndBlockSize(ppl.Pass):
 
     def _get_internal_threadblock_maps(self, state: SDFGState,
                                        kernel_map_entry: nodes.MapEntry) -> List[nodes.MapEntry]:
-        """
-        Returns GPU_ThreadBlock MapEntries nested within a given the GPU_Device scheduled kernel map
-        (kernel_map_entry).
-
-        Returns:
-            A List of GPU_ThreadBlock scheduled maps.
-        """
+        """Return the ``GPU_ThreadBlock`` ``MapEntry`` nodes nested within ``kernel_map_entry``."""
         threadblock_maps = []
 
         for _, scope in helpers.get_internal_scopes(state, kernel_map_entry):

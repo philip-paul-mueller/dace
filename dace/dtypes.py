@@ -101,7 +101,15 @@ GPU_STORAGES = [
     StorageType.GPU_Shared,
 ]
 
-GPU_KERNEL_ACCESSIBLE_STORAGES = [StorageType.GPU_Global, StorageType.GPU_Shared, StorageType.Register]
+GPU_RESIDENT_STORAGES = frozenset({
+    StorageType.GPU_Global,
+    StorageType.GPU_Shared,
+})
+CPU_RESIDENT_STORAGES = frozenset({
+    StorageType.CPU_Heap,
+    StorageType.CPU_Pinned,
+    StorageType.CPU_ThreadLocal,
+})
 
 
 class ReductionType(Enum):
@@ -397,10 +405,10 @@ class typeclass(object):
         return self.type(*args, **kwargs)
 
     def __eq__(self, other):
-        return other is not None and self.ctype == other.ctype
+        return other is not None and self.ctype == getattr(other, 'ctype', False)
 
     def __ne__(self, other):
-        return other is not None and self.ctype != other.ctype
+        return other is not None and self.ctype != getattr(other, 'ctype', False)
 
     def __getitem__(self, s):
         """ This is syntactic sugar that allows us to define an array type

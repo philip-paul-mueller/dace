@@ -1,16 +1,6 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
-"""Tests for :class:`MonolithicSingleStreamGPUScheduler`.
-
-The monolithic strategy is the right fit for all-on-GPU stencils: every
-kernel runs on stream 0, and the only places that need an explicit
-``cudaStreamSynchronize`` are the host transfer boundaries (one state-end
-sync per state with a ``CopyLibraryNode``, plus a trailing sync at any
-program-sink state without one).
-
-For a typical "copy-in / iterate / copy-out" pattern the result is **two**
-sync tasklets total: one after the H2D copy state and one at the program
-exit (which is also the D2H state).
-"""
+"""Asserts ``MonolithicSingleStreamGPUScheduler`` places every kernel on one stream with syncs only at
+host-transfer boundaries, and rejects CPU-only programs."""
 import dace
 import numpy as np
 import pytest
@@ -57,7 +47,7 @@ def _count_sync_tasklets(sdfg):
 
 
 def _build_gpu_sdfg(program, *, monolithic: bool):
-    """to_sdfg → auto_optimize for GPU → run the requested stream pipeline."""
+    """to_sdfg -> auto_optimize for GPU -> run the requested stream pipeline."""
     sdfg = program.to_sdfg()
     sdfg = auto_optimize(sdfg, dace.dtypes.DeviceType.GPU)
     strategy = MonolithicSingleStreamGPUScheduler() if monolithic else None
@@ -68,6 +58,7 @@ def _build_gpu_sdfg(program, *, monolithic: bool):
 @pytest.mark.gpu
 @pytest.mark.new_gpu_codegen_only
 def test_monolithic_jacobi_2d_two_syncs_and_correctness():
+    """Monolithic-scheduled ``jacobi_2d`` emits exactly two sync tasklets and matches the CPU reference."""
     TSTEPS, n_val = 20, 30
     rng = np.random.default_rng(0)
     A = rng.standard_normal((n_val, n_val), dtype=np.float32)
@@ -90,6 +81,7 @@ def test_monolithic_jacobi_2d_two_syncs_and_correctness():
 @pytest.mark.gpu
 @pytest.mark.new_gpu_codegen_only
 def test_monolithic_heat_3d_two_syncs_and_correctness():
+    """Monolithic-scheduled ``heat_3d`` emits exactly two sync tasklets and matches the CPU reference."""
     TSTEPS, n_val = 20, 10
     rng = np.random.default_rng(0)
     A = rng.standard_normal((n_val, n_val, n_val), dtype=np.float64)
@@ -110,7 +102,7 @@ def test_monolithic_heat_3d_two_syncs_and_correctness():
 
 
 def test_monolithic_strategy_rejects_cpu_only_program():
-    """The strategy must crash on a CPU-only SDFG — it's opted into explicitly."""
+    """The strategy must crash on a CPU-only SDFG -- it's opted into explicitly."""
 
     @dace.program
     def add_cpu(A: dace.float32[16], B: dace.float32[16], C: dace.float32[16]):

@@ -1,4 +1,5 @@
-# Copyright 2019-2025 ETH Zurich and the DaCe authors. All rights reserved.
+# Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
+"""Experimental CUDA code generator: emits kernels, streams, and host glue for GPU SDFGs."""
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 import networkx as nx
 
@@ -33,6 +34,11 @@ from dace.codegen.targets import cpp
 if TYPE_CHECKING:
     from dace.codegen.targets.framecode import DaCeCodeGenerator
     from dace.codegen.targets.cpu import CPUCodeGen
+
+# Allocation lifetimes that place an array in the program-global scope (declared
+# once and freed at teardown) rather than transiently inside a state or scope.
+_GLOBAL_LIFETIMES = (dtypes.AllocationLifetime.Global, dtypes.AllocationLifetime.Persistent,
+                     dtypes.AllocationLifetime.External)
 
 
 @registry.autoregister_params(name='experimental_cuda')
@@ -89,7 +95,7 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
         self._tb_inserted_kernels: Set[nodes.MapEntry] = set()
         self._kernel_arglists: Dict[nodes.MapEntry, Dict[str, dt.Data]] = {}
 
-    def preprocess(self, sdfg: SDFG) -> None:
+    def preprocess(self, sdfg: SDFG):
         """Prepare the SDFG for GPU code generation.
 
         All SDFG-level transformation lives in
@@ -137,7 +143,7 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
                 self._kernel_arglists[node] = state.scope_subgraph(node).arglist(defined_syms,
                                                                                  shared_transients[state.parent])
 
-    def _rebuild_frame_symbol_cache(self, sdfg: SDFG) -> None:
+    def _rebuild_frame_symbol_cache(self, sdfg: SDFG):
         """Re-seed the framecode's symbol/constant cache for the current SDFG hierarchy.
 
         Needed whenever ``preprocess`` adds new nested SDFGs -- the cache is keyed
@@ -173,10 +179,13 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
             if self.backend != 'cuda':
                 raise ValueError(f'Backend "{self.backend}" does not support the memory pool allocation hint')
 
-            pooled = filter(
-                lambda aname: sdfg.arrays[aname].lifetime in
-                (dtypes.AllocationLifetime.Global, dtypes.AllocationLifetime.Persistent, dtypes.AllocationLifetime.
-                 External), pooled)
+            # Kept as a lazy ``filter`` to mirror the legacy ``cuda`` target bug-for-bug:
+            # materializing it (``set(...)``) would actually populate ``pool_release``,
+            # but ``deallocate_array`` looks up that dict by ``ptr()``-resolved name while
+            # the keys here are raw names, so a Persistent/External pooled array would be
+            # freed both in ``generate_state`` and in ``deallocate_array``. The filter+key
+            # mismatch is a coupled pre-existing issue to fix in both targets together.
+            pooled = filter(lambda aname: sdfg.arrays[aname].lifetime in _GLOBAL_LIFETIMES, pooled)
 
             if reachability is None:
                 reachability = ap.StateReachability().apply_pass(top_sdfg, {})
@@ -200,19 +209,17 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
 
                     # Release at end of the last memlet path out of the terminator access node;
                     # if the terminator sits inside a scope, defer release to the end of state.
+                    # If the terminator sits inside a scope, defer release to the
+                    # end of state (empty set); otherwise release at the common
+                    # descendant following the ends of all memlet paths
+                    # (e.g., (a)->...->[tasklet]-->...->(b)).
                     terminators = set()
-                    if terminator is not None:
-                        parent = state.entry_node(terminator)
-                        if parent is not None:
-                            terminators = set()
-                        else:
-                            # Otherwise, find common descendant (or end of state) following the ends of
-                            # all memlet paths (e.g., (a)->...->[tasklet]-->...->(b))
-                            for e in state.out_edges(terminator):
-                                if isinstance(e.dst, nodes.EntryNode):
-                                    terminators.add(state.exit_node(e.dst))
-                                else:
-                                    terminators.add(e.dst)
+                    if terminator is not None and state.entry_node(terminator) is None:
+                        for e in state.out_edges(terminator):
+                            if isinstance(e.dst, nodes.EntryNode):
+                                terminators.add(state.exit_node(e.dst))
+                            else:
+                                terminators.add(e.dst)
 
                     self.pool_release[(sdfg, aname)] = (state, terminators)
 
@@ -241,7 +248,7 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
         return True
 
     def generate_scope(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg_scope: ScopeSubgraphView, state_id: int,
-                       function_stream: CodeIOStream, callsite_stream: CodeIOStream) -> None:
+                       function_stream: CodeIOStream, callsite_stream: CodeIOStream):
 
         from dace.codegen.targets.experimental_cuda_helpers.scope_strategies import (ScopeGenerationStrategy,
                                                                                      KernelScopeGenerator,
@@ -252,7 +259,6 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
         if not self._in_device_code:
 
             state = cfg.state(state_id)
-            scope_entry = dfg_scope.source_nodes()[0]
             scope_exit = dfg_scope.sink_nodes()[0]
             scope_entry_stream = CodeIOStream()
             scope_exit_stream = CodeIOStream()
@@ -339,9 +345,7 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
             self._in_device_code = False
             host_ptrname = cpp.ptr(name, data_desc, sdfg, self._frame)
 
-            is_global: bool = data_desc.lifetime in (dtypes.AllocationLifetime.Global,
-                                                     dtypes.AllocationLifetime.Persistent,
-                                                     dtypes.AllocationLifetime.External)
+            is_global: bool = data_desc.lifetime in _GLOBAL_LIFETIMES
             defined_type, ctype = dispatcher.defined_vars.get(host_ptrname, is_global=is_global)
 
             self._in_device_code = True
@@ -355,8 +359,7 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
         self._in_device_code = restore_in_device_code
 
     def _declare_and_invoke_kernel_wrapper(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg_scope: ScopeSubgraphView,
-                                           state_id: int, function_stream: CodeIOStream,
-                                           callsite_stream: CodeIOStream) -> None:
+                                           state_id: int, function_stream: CodeIOStream, callsite_stream: CodeIOStream):
 
         scope_entry = dfg_scope.source_nodes()[0]
 
@@ -388,7 +391,7 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
             callsite_stream.write('}', cfg, state_id, scope_entry)
 
     def _generate_kernel_wrapper(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg_scope: ScopeSubgraphView, state_id: int,
-                                 function_stream: CodeIOStream, callsite_stream: CodeIOStream) -> None:
+                                 function_stream: CodeIOStream, callsite_stream: CodeIOStream):
 
         scope_entry = dfg_scope.source_nodes()[0]
 
@@ -449,12 +452,12 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
     def copy_memory(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg: StateSubgraphView, state_id: int,
                     src_node: Union[nodes.Tasklet, nodes.AccessNode], dst_node: Union[nodes.CodeNode, nodes.AccessNode],
                     edge: Tuple[nodes.Node, str, nodes.Node, str,
-                                Memlet], function_stream: CodeIOStream, callsite_stream: CodeIOStream) -> None:
-        # All CPU↔GPU and GPU↔GPU AccessNode→AccessNode edges (host-issued
+                                Memlet], function_stream: CodeIOStream, callsite_stream: CodeIOStream):
+        # All CPU<->GPU and GPU<->GPU AccessNode->AccessNode edges (host-issued
         # and in-kernel collaborative) are lifted to ``CopyLibraryNode`` by
         # ``InsertExplicitGPUGlobalMemoryCopies`` during ``preprocess()`` and
         # lowered through their expansions. Anything reaching this dispatch
-        # is a register / scope-local CPU copy — delegate to CPU codegen.
+        # is a register / scope-local CPU copy -- delegate to CPU codegen.
         self._cpu_codegen.copy_memory(sdfg, cfg, dfg, state_id, src_node, dst_node, edge, None, callsite_stream)
 
     def state_dispatch_predicate(self, sdfg, state):
@@ -484,7 +487,7 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
                        state: SDFGState,
                        function_stream: CodeIOStream,
                        callsite_stream: CodeIOStream,
-                       generate_state_footer: bool = False) -> None:
+                       generate_state_footer: bool = False):
 
         self._frame.generate_state(sdfg, cfg, state, function_stream, callsite_stream)
 
@@ -519,7 +522,7 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
                 instr.on_state_end(sdfg, cfg, state, callsite_stream, function_stream)
 
     def generate_node(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg: StateSubgraphView, state_id: int, node: nodes.Node,
-                      function_stream: CodeIOStream, callsite_stream: CodeIOStream) -> None:
+                      function_stream: CodeIOStream, callsite_stream: CodeIOStream):
 
         gen = getattr(self, '_generate_' + type(node).__name__, False)
 
@@ -549,8 +552,7 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
         return args
 
     def _generate_NestedSDFG(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg: StateSubgraphView, state_id: int,
-                             node: nodes.NestedSDFG, function_stream: CodeIOStream,
-                             callsite_stream: CodeIOStream) -> None:
+                             node: nodes.NestedSDFG, function_stream: CodeIOStream, callsite_stream: CodeIOStream):
         old_schedule = self._toplevel_schedule
         nested_schedule = get_node_schedule(sdfg, dfg, node)
         if nested_schedule != dtypes.ScheduleType.Default:
@@ -569,7 +571,7 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
         self._toplevel_schedule = old_schedule
 
     def _generate_Tasklet(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg: StateSubgraphView, state_id: int,
-                          node: nodes.Tasklet, function_stream: CodeIOStream, callsite_stream: CodeIOStream) -> None:
+                          node: nodes.Tasklet, function_stream: CodeIOStream, callsite_stream: CodeIOStream):
         from dace.codegen.targets.experimental_cuda_helpers.scope_strategies import ScopeManager
 
         tasklet: nodes.Tasklet = node
@@ -626,20 +628,16 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
             result += f' + gridDim.x * gridDim.y * blockIdx.z'
         return result
 
-    #######################################################################
-    # Array Declaration, Allocation and Deallocation
-
     def declare_array(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg: StateSubgraphView, state_id: int,
                       node: nodes.AccessNode, nodedesc: dt.Data, function_stream: CodeIOStream,
-                      declaration_stream: CodeIOStream) -> None:
+                      declaration_stream: CodeIOStream):
 
         ptrname = ptr(node.data, nodedesc, sdfg, self._frame)
         fsymbols = self._frame.symbols_and_constants(sdfg)
 
-        # ----------------- Guard checks --------------------
-
-        # NOTE: `dfg` is None iff `nodedesc` is non-free symbol dependent (see DaCeCodeGenerator.determine_allocation_lifetime).
-        # We avoid `is_nonfree_sym_dependent` when dfg is None and `nodedesc` is a View.
+        # ``dfg`` is None iff ``nodedesc`` is non-free-symbol dependent (see
+        # DaCeCodeGenerator.determine_allocation_lifetime); skip the
+        # ``is_nonfree_sym_dependent`` check when dfg is None and ``nodedesc`` is a View.
         if dfg and not sdutil.is_nonfree_sym_dependent(node, nodedesc, dfg, fsymbols):
             raise NotImplementedError(
                 "declare_array is only for variables that require separate declaration and allocation.")
@@ -663,7 +661,7 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
 
     def allocate_array(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg: StateSubgraphView, state_id: int,
                        node: nodes.AccessNode, nodedesc: dt.Data, function_stream: CodeIOStream,
-                       declaration_stream: CodeIOStream, allocation_stream: CodeIOStream) -> None:
+                       declaration_stream: CodeIOStream, allocation_stream: CodeIOStream):
         """Declare and allocate a data container, dispatching on its storage type.
 
         Views and references fall through to the CPU codegen.  The actual allocation for
@@ -769,7 +767,7 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
 
     def deallocate_array(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg: StateSubgraphView, state_id: int,
                          node: nodes.AccessNode, nodedesc: dt.Data, function_stream: CodeIOStream,
-                         callsite_stream: CodeIOStream) -> None:
+                         callsite_stream: CodeIOStream):
 
         dataname = ptr(node.data, nodedesc, sdfg, self._frame)
 
@@ -777,11 +775,7 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
             dataname = f'({dataname} - {sym2cpp(nodedesc.start_offset)})'
 
         if self._dispatcher.declared_arrays.has(dataname):
-            is_global = nodedesc.lifetime in (
-                dtypes.AllocationLifetime.Global,
-                dtypes.AllocationLifetime.Persistent,
-                dtypes.AllocationLifetime.External,
-            )
+            is_global = nodedesc.lifetime in _GLOBAL_LIFETIMES
             self._dispatcher.declared_arrays.remove(dataname, is_global=is_global)
 
         if isinstance(nodedesc, dace.data.Stream):
@@ -988,7 +982,7 @@ int __dace_exit_experimental_cuda({sdfg_state_name} *__state) {{
 
     def define_out_memlet(self, sdfg: SDFG, cfg: ControlFlowRegion, state_dfg: StateSubgraphView, state_id: int,
                           src_node: nodes.Node, dst_node: nodes.Node, edge: MultiConnectorEdge[Memlet],
-                          function_stream: CodeIOStream, callsite_stream: CodeIOStream) -> None:
+                          function_stream: CodeIOStream, callsite_stream: CodeIOStream):
         self._cpu_codegen.define_out_memlet(sdfg, cfg, state_dfg, state_id, src_node, dst_node, edge, function_stream,
                                             callsite_stream)
 
@@ -997,19 +991,8 @@ int __dace_exit_experimental_cuda({sdfg_state_name} *__state) {{
 
 
 class KernelSpec:
-    """Kernel metadata (name, grid/block dims, arguments) used by ``ExperimentalCUDACodeGen``.
-
-    Public attributes:
-      - ``kernel_map_entry``: the ``GPU_Device`` MapEntry that is the kernel's root scope.
-      - ``kernel_map``: shorthand for ``kernel_map_entry.map``.
-      - ``kernel_name``: function name of the generated ``__global__``.
-      - ``kernel_constants``: data + symbols that take a ``const`` qualifier in the kernel signature.
-      - ``arglist``: ``{name: descriptor}`` for every kernel argument.
-      - ``args_as_input`` / ``args_typed``: kernel-side argument forms (call site / declaration).
-      - ``kernel_wrapper_args_as_input`` / ``kernel_wrapper_args_typed``: host-wrapper forms.
-      - ``grid_dims`` / ``block_dims``: launch geometry.
-      - ``warpSize``: backend warp size from config.
-      - ``gpu_index_ctype``: C type for thread/block/warp indices (``compiler.cuda.gpu_index_type``).
+    """Kernel metadata (name, grid/block dims, argument forms, warp size) used by
+    ``ExperimentalCUDACodeGen`` to emit the ``__global__`` and its host launch wrapper.
     """
 
     def __init__(self, cudaCodeGen: ExperimentalCUDACodeGen, sdfg: SDFG, cfg: ControlFlowRegion,

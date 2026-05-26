@@ -146,6 +146,7 @@ def set_default_schedule_and_storage_types(scope: Union[SDFG, SDFGState, nodes.E
     ``dtypes.DEFAULT_TOPLEVEL_SCHEDULE``.
     May raise ``InvalidSDFGNodeError`` if a default scope is ambiguous based on surrounding
     storage types.
+
     :param scope: The SDFG, state, or scope to infer.
     :param parent_schedules: A list of ScheduleType elements representing
                              an ordered list of schedules, from the global schedule
@@ -255,15 +256,6 @@ def _determine_schedule_from_storage(state: SDFGState, node: nodes.Node) -> Opti
         desc = sdfg.arrays[dname]
         if isinstance(desc, data.Scalar):
             continue  # Skip scalars
-
-        # The GPU stream handle array is plumbing, not data: it carries a
-        # scheduler-assigned stream slot into stream-using nodes and must
-        # not be interpreted as imposing a schedule constraint.  (Today it
-        # uses Register storage, which is already excluded by the map
-        # lookup below; this explicit guard keeps the invariant even if
-        # the stream array's storage changes in the future.)
-        if desc.dtype == dtypes.gpuStream_t:
-            continue
 
         storage = desc.storage
         if storage not in dtypes.STORAGEDEFAULT_SCHEDULE:
