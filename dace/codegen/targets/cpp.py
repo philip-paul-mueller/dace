@@ -877,8 +877,13 @@ def unparse_tasklet(sdfg, cfg, state_id, dfg, node, function_stream, callsite_st
                                None)
         body_str = node.code.as_string if hasattr(node.code, 'as_string') else str(node.code)
         if (host_node_on_gpu_memory and gpu_stream_conn is not None and '__dace_current_stream' in str(body_str)):
-            callsite_stream.write(f'{common.get_gpu_backend()}Stream_t __dace_current_stream = {gpu_stream_conn};', cfg,
-                                  state_id, node)
+            if gpu_stream_conn == '__dace_current_stream':
+                # The connector already exposes the symbol; skip the self-referential
+                # rebind that would redeclare it.
+                pass
+            else:
+                callsite_stream.write(f'{common.get_gpu_backend()}Stream_t __dace_current_stream = {gpu_stream_conn};',
+                                      cfg, state_id, node)
         elif host_node_on_gpu_memory and hasattr(node, "_cuda_stream"):
             if max_streams >= 0:
                 callsite_stream.write(

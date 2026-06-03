@@ -208,21 +208,28 @@ class InsertExplicitCopies(ppl.Pass):
             return False
 
         outer_memlet = edge.data
-        inner_subset = _derive_matching_dst_subset(outer_memlet.subset, inner_desc)
+        # The inner Memlet may be dst-relative (``data == inner_node.data``,
+        # outer-side subset in ``other_subset``); resolve the subset in the
+        # outer array's index space via ``get_src/dst_subset``.
+        if stage_in:
+            outer_subset = outer_memlet.get_src_subset(edge, state) or outer_memlet.subset
+        else:
+            outer_subset = outer_memlet.get_dst_subset(edge, state) or outer_memlet.subset
+        outer_side_memlet = Memlet(data=outer.data, subset=copy.deepcopy(outer_subset))
+        outer_side_memlet.dynamic = outer_memlet.dynamic
+        outer_side_memlet.wcr = outer_memlet.wcr
+        inner_subset = _derive_matching_dst_subset(outer_subset, inner_desc)
         inner_memlet = Memlet(data=inner_node.data, subset=inner_subset)
-        label = (f"copy_{outer_memlet.data}_to_{inner_node.data}"
-                 if stage_in else f"copy_{inner_node.data}_to_{outer_memlet.data}")
+        label = (f"copy_{outer.data}_to_{inner_node.data}" if stage_in else f"copy_{inner_node.data}_to_{outer.data}")
         libnode = CopyLibraryNode(name=label)
         state.add_node(libnode)
         if stage_in:
             map_node = edge.src
-            state.add_edge(map_node, edge.src_conn, libnode, CopyLibraryNode.INPUT_CONNECTOR_NAME,
-                           copy.deepcopy(outer_memlet))
+            state.add_edge(map_node, edge.src_conn, libnode, CopyLibraryNode.INPUT_CONNECTOR_NAME, outer_side_memlet)
             state.add_edge(libnode, CopyLibraryNode.OUTPUT_CONNECTOR_NAME, inner_node, None, inner_memlet)
         else:
             map_node = edge.dst
             state.add_edge(inner_node, None, libnode, CopyLibraryNode.INPUT_CONNECTOR_NAME, inner_memlet)
-            state.add_edge(libnode, CopyLibraryNode.OUTPUT_CONNECTOR_NAME, map_node, edge.dst_conn,
-                           copy.deepcopy(outer_memlet))
+            state.add_edge(libnode, CopyLibraryNode.OUTPUT_CONNECTOR_NAME, map_node, edge.dst_conn, outer_side_memlet)
         state.remove_edge(edge)
         return True

@@ -4,10 +4,11 @@ import warnings
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import dace
-from dace import properties
+from dace import dtypes, properties
 from dace.memlet import Memlet
 from dace.sdfg import graph, utils as sdutils
 from dace.transformation import helpers, pass_pipeline as ppl, transformation
+from dace.libraries.standard.helper import CURRENT_STREAM_NAME
 from dace.libraries.standard.nodes import copy_node, memset_node
 
 
@@ -343,7 +344,8 @@ class AssignmentAndCopyKernelToMemsetAndMemcpy(ppl.Pass):
             desc = sdfg.arrays[e.src.data]
             # A Scalar is passed by value (referenced bare, like the frontend's own
             # range-bound assignments); an Array is indexed by the edge's subset.
-            assignments[e.dst_conn] = e.src.data if isinstance(desc, dace.data.Scalar) else f"{e.src.data}[{e.data.subset}]"
+            assignments[e.dst_conn] = e.src.data if isinstance(desc,
+                                                               dace.data.Scalar) else f"{e.src.data}[{e.data.subset}]"
             if e.dst_conn not in sdfg.symbols:
                 sdfg.add_symbol(e.dst_conn, desc.dtype)
         state.parent_graph.add_state_before(state, assignments=assignments)
@@ -420,8 +422,7 @@ class AssignmentAndCopyKernelToMemsetAndMemcpy(ppl.Pass):
                     f"{clashes} which would clash with the new library node's connectors.", UserWarning)
             return False
 
-        if not self._hoist_dynamic_inputs_to_symbols(state, map_entry,
-                                                     self._subset_symbols(begin_subset, exit_subset)):
+        if not self._hoist_dynamic_inputs_to_symbols(state, map_entry, self._subset_symbols(begin_subset, exit_subset)):
             if verbose:
                 warnings.warn(
                     f"Skipping {kind} lift in map {map_entry.map.label}: a dynamic-range source scalar is "
@@ -523,9 +524,15 @@ class AssignmentAndCopyKernelToMemsetAndMemcpy(ppl.Pass):
             passthrough_conns = [(path[-2].dst_conn, map_exit)]
             if not is_memset:
                 passthrough_conns.append((path[0].dst_conn, node))
-            if not self._lift_preconditions_ok(state, node, kind=kind, passthrough_conns=passthrough_conns,
-                                               libnode_conn_names=libnode_conn_names, begin_subset=begin_subset,
-                                               exit_subset=exit_subset, copy_length=copy_length, verbose=verbose):
+            if not self._lift_preconditions_ok(state,
+                                               node,
+                                               kind=kind,
+                                               passthrough_conns=passthrough_conns,
+                                               libnode_conn_names=libnode_conn_names,
+                                               begin_subset=begin_subset,
+                                               exit_subset=exit_subset,
+                                               copy_length=copy_length,
+                                               verbose=verbose):
                 continue
 
             if is_memset:
@@ -540,12 +547,33 @@ class AssignmentAndCopyKernelToMemsetAndMemcpy(ppl.Pass):
                                dace.memlet.Memlet(subset=dace.subsets.Range(begin_subset), data=src_access_node.data))
                 state.add_edge(libnode, libnode_cls.OUTPUT_CONNECTOR_NAME, dst_access_node, None,
                                dace.memlet.Memlet(subset=dace.subsets.Range(exit_subset), data=dst_access_node.data))
+            self._transfer_stream_wiring(state, node, libnode)
             self.rmid += 1
             rmed_count += 1
             joined_edges.update(path)
 
         self.rm_edges(state, joined_edges)
         return rmed_count
+
+    def _transfer_stream_wiring(self, state: dace.SDFGState, map_entry: dace.nodes.MapEntry,
+                                libnode: dace.nodes.LibraryNode):
+        """Move the GPU-stream in-wiring from ``map_entry`` onto ``libnode``.
+
+        The pre-lift map carries a ``__dace_current_stream`` in-connector that the
+        stream scheduler wired to a ``gpu_streams[i]`` AccessNode. The expanded
+        cudaMemcpy*Async tasklet derived from ``libnode`` needs the same stream
+        binding, so we re-source the edge onto the libnode. Without this transfer
+        the post-expansion scheduler re-entry is gated by ``is_gpu_lowering_applied``
+        and the new tasklet never gets a stream.
+        """
+        if CURRENT_STREAM_NAME not in map_entry.in_connectors:
+            return
+        stream_in_edges = [e for e in state.in_edges(map_entry) if e.dst_conn == CURRENT_STREAM_NAME]
+        if not stream_in_edges:
+            return
+        libnode.add_in_connector(CURRENT_STREAM_NAME, dtypes.gpuStream_t)
+        for e in stream_in_edges:
+            state.add_edge(e.src, e.src_conn, libnode, CURRENT_STREAM_NAME, dace.memlet.Memlet.from_memlet(e.data))
 
     def _has_passthrough_connectors(self, n: dace.nodes.Node) -> bool:
         """Whether ``n`` carries scope-passthrough connectors.
@@ -656,9 +684,8 @@ class AssignmentAndCopyKernelToMemsetAndMemcpy(ppl.Pass):
             # symbol directly; nest the map in its own SDFG (whole arrays passed
             # in, the scalar arriving as a read-only input) and lift inside,
             # where the safe-hoist applies.
-            if self._needs_nesting_for_dynamic_inputs(state, node) and (
-                    self._detect_contiguous_memcpy_paths(state, node)
-                    or self._detect_contiguous_memset_paths(state, node)):
+            if self._needs_nesting_for_dynamic_inputs(state, node) and (self._detect_contiguous_memcpy_paths(
+                    state, node) or self._detect_contiguous_memset_paths(state, node)):
                 subgraph = state.scope_subgraph(node, include_entry=True, include_exit=True)
                 nsdfg_node = helpers.nest_state_subgraph(state.sdfg, state, subgraph, full_data=True)
                 rmed_memcpies[node] = self.apply_pass(nsdfg_node.sdfg, {})

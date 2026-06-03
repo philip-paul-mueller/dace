@@ -697,13 +697,23 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
 
     def _declare_pointer_if_needed(self, sdfg: SDFG, cfg: ControlFlowRegion, state_id: int, node: nodes.AccessNode,
                                    nodedesc: dt.Data, declaration_stream: CodeIOStream) -> str:
-        """Emit ``T* {name};`` once and register it in defined_vars; return the
-        resolved data name. No-op if a prior pass already declared it."""
+        """Emit ``T* {name};`` once and register the host pointer in ``defined_vars``.
+
+        Hoist the binding above ``SDFGState`` scopes (which are popped between
+        states) so a Scope-lifetime transient declared at SDFG scope and
+        allocated at first-state scope stays visible to the consuming state.
+        Stay at the current scope when it is already an ``SDFG`` (nested SDFG
+        codegen) -- its ``can_access_parent=False`` blocks the outer frame.
+        """
+        from dace.sdfg.state import SDFGState
         dataname = ptr(node.data, nodedesc, sdfg, self._frame)
+        array_ctype = f'{nodedesc.dtype.ctype} *'
         if not self._dispatcher.declared_arrays.has(dataname):
-            array_ctype = f'{nodedesc.dtype.ctype} *'
             declaration_stream.write(f'{array_ctype} {dataname};\n', cfg, state_id, node)
-            self._dispatcher.defined_vars.add(dataname, DefinedType.Pointer, array_ctype)
+        if not self._dispatcher.defined_vars.has(dataname):
+            topmost_parent, _, _ = self._dispatcher.defined_vars._scopes[-1]
+            ancestor = 1 if isinstance(topmost_parent, SDFGState) else 0
+            self._dispatcher.defined_vars.add(dataname, DefinedType.Pointer, array_ctype, ancestor=ancestor)
         return dataname
 
     def _prepare_GPU_Global_array(self, sdfg: SDFG, cfg: ControlFlowRegion, dfg: StateSubgraphView, state_id: int,
@@ -1043,9 +1053,14 @@ class KernelSpec:
                 f"There can not be more than one GPU stream assigned to a kernel, but {len(gpustream_input)} were assigned."
             )
 
+        # If no stream edge was wired to this kernel (e.g. the kernel sits inside a
+        # libnode-expanded NestedSDFG whose stream chain hasn't been propagated past
+        # expansion), launch on the default stream (CUDA stream 0 / ``nullptr``).
+        stream_arg = str(gpustream_input[0].dst_conn) if gpustream_input else "nullptr"
+
         self.kernel_wrapper_args_as_input: List[str] = (
             ['__state'] + [ptr(name, data, sdfg, cudaCodeGen._frame)
-                           for name, data in self.arglist.items()] + [str(gpustream_input[0].dst_conn)])
+                           for name, data in self.arglist.items()] + [stream_arg])
 
         self.kernel_wrapper_args_typed: List[str] = (
             [f'{mangle_dace_state_struct_name(cudaCodeGen._global_sdfg)} *__state'] + args_typed +
