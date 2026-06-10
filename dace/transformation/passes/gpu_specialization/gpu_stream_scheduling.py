@@ -757,7 +757,7 @@ class AutoSingleStreamGPUScheduler(GPUStreamSchedulingStrategy):
                 # Find the scope the node is in.
                 if scope_dict[node] is None:
                     # The nested SDFG is directly on the top level, so we have to check it.
-                    self._recursive(node.sdfg, stream_array_name)
+                    self._add_sync_state(node.sdfg, stream_array_name)
 
                 else:
                     # The node is nested inside a Map. We have to check if one of these Map
@@ -769,7 +769,7 @@ class AutoSingleStreamGPUScheduler(GPUStreamSchedulingStrategy):
                             break
                     else:
                         # It is not in a GPU scope, so we must process it.
-                        self._recursive(node.sdfg, stream_array_name)
+                        self._add_sync_state(node.sdfg, stream_array_name)
 
             # We need a sync after a GPU state. This is needed because stream assignment
             #  only considers a single edge. If it would consider multiple edges it is not
