@@ -619,6 +619,7 @@ class AutoSingleStreamGPUScheduler(GPUStreamSchedulingStrategy):
         for nsdfg in sdfg.all_sdfgs_recursive():
             for state in nsdfg.states():
                 for node in state.nodes():
+                    # NOTE: This does not check "top level" for that the `scope_dict` would need to be inspected.
                     if _classify_node(node, nsdfg, state) == _Kind.MIXED:
                         offenders.append(f"{type(node).__name__} '{getattr(node, 'label', node)}' in state "
                                          f"'{state.label}' (SDFG '{nsdfg.name}')")
@@ -692,6 +693,9 @@ class AutoSingleStreamGPUScheduler(GPUStreamSchedulingStrategy):
         stream_array_name = get_gpu_stream_array_name()
 
         # Snapshot iedges first; splicing mutates each region's edge set.
+        # NOTE: This ignores edges between Regions. Essentially it assumes a flat state machine,
+        #   because it assumes that it can get the producing state by checking `edge.src`. However,
+        #   this might be an `AbstractControlflowRegion` with multiple terminal states.
         edges_to_splice: List[Tuple['AbstractControlFlowRegion', any]] = []
         for region in sdfg.all_control_flow_regions(recursive=True):
             for edge in list(region.edges()):
@@ -710,15 +714,37 @@ class AutoSingleStreamGPUScheduler(GPUStreamSchedulingStrategy):
         for region, edge in edges_to_splice:
             _splice_sync_state_on_edge(region, edge, sdfg, stream_array_name)
 
-        # Region-level sinks (GPU states with no outgoing iedge in their own region) get a
-        # trailing sync state. We iterate per region rather than only root sinks so a GPU sink
-        # at the bottom of a LoopRegion / ConditionalBlock branch also picks up a sync.
-        for region in sdfg.all_control_flow_regions(recursive=True):
-            for state in list(region.nodes()):
-                if not isinstance(state, SDFGState):
+    def _recursive(self, sdfg: dace.SDFG, stream_array_name: str):
+        for state in list(sdfg.states()):
+            scope_dict = state.scope_dict()
+
+            # Descend into nested SDFGs if needed (I think it should be before the `continue`).
+            for node in state.nodes():
+                if not isinstance(node, nodes.NestedSDFG):
                     continue
-                if self._state_kinds.get(state) != _Kind.GPU:
-                    continue
-                if region.out_degree(state) != 0:
-                    continue
-                _append_program_end_sync_state(region, state, stream_array_name)
+
+                # Find the scope the node is in.
+                if scope_dict[node] is None:
+                    # The nested SDFG is directly on the top level, so we have to check it.
+                    self._recursive(node.sdfg, stream_array_name)
+
+                else:
+                    # The node is nested inside a Map. We have to check if one of these Map
+                    #  is a GPU Map.
+                    enclosing_scope = scope_dict[node]
+                    while enclosing_scope is not None:
+                        assert isinstance(enclosing_scope, nodes.MapEntry)
+                        if enclosing_scope.map.schedule in dtypes.GPU_SCHEDULES:
+                            break
+                    else:
+                        # It is not in a GPU scope, so we must process it.
+                        self._recursive(node.sdfg, stream_array_name)
+
+            # We need a sync after a GPU state. This is needed because stream assignment
+            #  only considers a single edge. If it would consider multiple edges it is not
+            #  needed.
+            if self._state_kinds.get(state) != _Kind.GPU:
+                continue
+
+            # Now append the sync.
+            _append_program_end_sync_state(state.parent_graph, state, stream_array_name)
