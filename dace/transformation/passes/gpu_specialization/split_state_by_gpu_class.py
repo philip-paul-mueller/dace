@@ -28,6 +28,8 @@ back to the naive strategy.
 """
 from typing import Dict, List, Optional, Set, Tuple
 
+import networkx as nx
+
 from dace import SDFG, SDFGState
 from dace.sdfg import nodes
 from dace.sdfg.graph import SubgraphView
@@ -38,28 +40,19 @@ from dace.transformation.passes.gpu_specialization.gpu_stream_scheduling import 
 
 
 def _weakly_connected_components(state: SDFGState) -> List[Set[nodes.Node]]:
-    """Weakly connected components of ``state``'s dataflow graph (undirected reachability)."""
-    visited: Set[nodes.Node] = set()
-    components: List[Set[nodes.Node]] = []
-    for seed in state.nodes():
-        if seed in visited:
-            continue
-        component: Set[nodes.Node] = set()
-        stack = [seed]
-        while stack:
-            n = stack.pop()
-            if n in visited:
-                continue
-            visited.add(n)
-            component.add(n)
-            for nb in state.neighbors(n):
-                if nb not in visited:
-                    stack.append(nb)
-        components.append(component)
-    return components
+    """Compute the weakly connected components of ``state``'s dataflow graph.
+
+    Uses the underlying networkx ``DiGraph`` (``state.nx``) so the implementation tracks any
+    future graph-internal changes in DaCe.
+
+    :param state: The dataflow state to decompose.
+    :return: A list of node sets, one per component.
+    """
+    return [set(c) for c in nx.weakly_connected_components(state.nx)]
 
 
 def _wcc_kind(wcc: Set[nodes.Node], sdfg: SDFG, state: SDFGState) -> _Kind:
+    """Fold ``_classify_node`` over ``wcc``'s nodes to get the component-level kind."""
     return _fold_kinds(_classify_node(n, sdfg, state) for n in wcc)
 
 
@@ -147,12 +140,18 @@ class SplitStateByGPUClass(ppl.Pass):
         from dace.transformation.passes.gpu_specialization.helpers.gpu_helpers import is_stream_wiring_applied
         if is_stream_wiring_applied(sdfg):
             return None
+        # Only attempt to split root-level ``SDFGState`` blocks. Other top-level block kinds
+        # (``LoopRegion``, ``ConditionalBlock``, anything yielded by an inner ``NestedSDFG``)
+        # are opaque to this pass: ``state_fission`` operates on dataflow nodes, and the
+        # AutoSingleStreamGPUScheduler classifies these other blocks as a whole, so the
+        # GPU/CPU boundary is handled at their parent iedges rather than by lifting inner
+        # subgraphs.
         states_split = 0
-        for nsdfg in sdfg.all_sdfgs_recursive():
-            # Snapshot states() -- state_fission mutates the CFG.
-            for state in list(nsdfg.states()):
-                if self._split_one_state(state, nsdfg):
-                    states_split += 1
+        for block in list(sdfg.nodes()):
+            if not isinstance(block, SDFGState):
+                continue
+            if self._split_one_state(block, sdfg):
+                states_split += 1
         return {'states_split': states_split} if states_split else None
 
     @staticmethod
