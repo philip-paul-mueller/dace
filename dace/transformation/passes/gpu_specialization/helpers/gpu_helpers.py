@@ -35,12 +35,18 @@ def dependency_edge():
     return Memlet()
 
 
-def is_gpu_lowering_applied(sdfg: SDFG) -> bool:
-    """True iff the gpu_specialization lowering has already run on ``sdfg``.
-
-    Signalled by the ``gpu_streams`` transient; used to short-circuit a re-application.
+def is_stream_wiring_applied(sdfg: SDFG) -> bool:
+    """True iff the stream-wiring step has already produced the ``gpu_streams``
+    array + sync wiring on ``sdfg``. Only the *wiring* step is single-shot;
+    scheduling is now persisted per node via ``Node.gpu_stream_id`` and
+    survives serialisation. Used by :class:`GPUStreamWiring` to skip re-wiring.
     """
     return get_gpu_stream_array_name() in sdfg.arrays
+
+
+# Backwards-compatible alias -- old name conflated "scheduling done" with
+# "wiring done"; new code should prefer the wiring-specific name.
+is_gpu_lowering_applied = is_stream_wiring_applied
 
 
 def enclosing_map_chain(state: SDFGState, node: nodes.Node, schedule: dtypes.ScheduleType) -> List[nodes.MapEntry]:
@@ -217,32 +223,3 @@ def find_inner_gpu_consumers(sdfg: SDFG):
             for node in state.nodes():
                 if is_gpu_stream_consumer(node, nsdfg, state):
                     yield node, nsdfg, state
-
-
-def read_stream_assignments_from_wired_sdfg(sdfg: SDFG):
-    """Recover ``{node: stream_id}`` from a post-pipeline SDFG.
-
-    Reads the ``gpu_streams[<i>]`` subset wired into each consumer's
-    stream in-connector. Re-running the scheduler instead would differ
-    because pipeline-internal nodes stitch otherwise-independent
-    components together. Returns ``{}`` if the lowering hasn't run yet.
-    """
-    if not is_gpu_lowering_applied(sdfg):
-        return {}
-    stream_array = get_gpu_stream_array_name()
-    assignments = {}
-    for node, parent_sdfg, state in find_inner_gpu_consumers(sdfg):
-        for edge in state.in_edges(node):
-            if not edge.dst_conn or not is_stream_typed_connector(node, edge.dst_conn):
-                continue
-            if edge.data is None or edge.data.data != stream_array or edge.data.subset is None:
-                continue
-            # The wired memlet is ``gpu_streams[<i>]`` -- a single-element
-            # ``Range`` whose start equals its end. Read the start.
-            try:
-                stream_id = int(edge.data.subset[0][0])
-            except (TypeError, ValueError, IndexError):
-                continue
-            assignments[node] = stream_id
-            break
-    return assignments
