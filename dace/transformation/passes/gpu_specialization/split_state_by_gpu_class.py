@@ -192,7 +192,9 @@ class SplitStateByGPUClass(ppl.Pass):
 
         # First fission: lift everything that should land before the GPU work.
         if before_nodes:
-            state_fission(SubgraphView(state, list(before_nodes)), label=f"{state.label}_cpu_before")
+            state_fission(SubgraphView(state, list(before_nodes)),
+                          label=f"{state.label}_cpu_before",
+                          allow_isolated_nodes=False)
 
         # Second fission: if any chain has a CPU suffix, lift the GPU work out of the original
         # state so the suffix is left as the (now-trailing) state. We collect: pure-GPU WCCs
@@ -204,6 +206,8 @@ class SplitStateByGPUClass(ppl.Pass):
             for _prefix, middle, _suffix in chains:
                 gpu_to_lift.update(middle)
             if gpu_to_lift:
-                state_fission(SubgraphView(state, list(gpu_to_lift)), label=f"{state.label}_gpu_middle")
+                state_fission(SubgraphView(state, list(gpu_to_lift)),
+                              label=f"{state.label}_gpu_middle",
+                              allow_isolated_nodes=False)
 
         return True
