@@ -191,6 +191,8 @@ class SplitStateByGPUClass(ppl.Pass):
             return False
 
         # First fission: lift everything that should land before the GPU work.
+        # ``allow_isolated_nodes=False`` -- ``state_fission`` keeps isolated nodes in the
+        # original state by default; we want them moved into the new prefix state.
         if before_nodes:
             state_fission(SubgraphView(state, list(before_nodes)),
                           label=f"{state.label}_cpu_before",

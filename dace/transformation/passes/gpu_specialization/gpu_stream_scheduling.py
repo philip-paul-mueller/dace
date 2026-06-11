@@ -13,8 +13,10 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Set, Tuple, Type, Union
 
+import networkx as nx
+
 import dace
-from dace import SDFG, SDFGState, dtypes, properties
+from dace import SDFG, SDFGState, data, dtypes, properties
 from dace.config import Config
 from dace.memlet import Memlet
 from dace.sdfg import nodes
@@ -211,24 +213,13 @@ class NaiveGPUStreamScheduler(GPUStreamSchedulingStrategy):
                 gpu_stream = self._next_stream(gpu_stream)
 
     def _weakly_connected(self, graph: Graph) -> List[Set[NodeT]]:
-        visited: Set[NodeT] = set()
-        components: List[Set[NodeT]] = []
-        for node in graph.nodes():
-            if node in visited:
-                continue
-            component: Set[NodeT] = set()
-            stack = [node]
-            while stack:
-                current = stack.pop()
-                if current in visited:
-                    continue
-                visited.add(current)
-                component.add(current)
-                for neighbor in graph.neighbors(current):
-                    if neighbor not in visited:
-                        stack.append(neighbor)
-            components.append(component)
-        return components
+        """Weakly connected components of ``graph``'s dataflow.
+
+        Uses the underlying networkx ``DiGraph`` exposed by :attr:`OrderedDiGraph.nx`
+        so the implementation tracks DaCe's own graph internals (matches the same
+        refactor in :mod:`split_state_by_gpu_class`).
+        """
+        return [set(c) for c in nx.weakly_connected_components(graph.nx)]
 
     def _next_stream(self, gpu_stream: int) -> int:
         if self._max_concurrent_streams == 0:
@@ -299,7 +290,7 @@ class MonolithicSingleStreamGPUScheduler(GPUStreamSchedulingStrategy):
                 for node in state.nodes():
                     why = self._not_acceptable_reason(node, nsdfg, state)
                     if why is not None:
-                        offenders.append(f"{type(node).__name__} '{getattr(node, 'label', node)}' in state "
+                        offenders.append(f"{type(node).__name__} '{node.label}' in state "
                                          f"'{state.label}' (SDFG '{nsdfg.name}'): {why}")
         if offenders:
             raise ValueError("MonolithicSingleStreamGPUScheduler requires every Tasklet/LibraryNode "
@@ -333,11 +324,11 @@ class MonolithicSingleStreamGPUScheduler(GPUStreamSchedulingStrategy):
         if isinstance(node, nodes.LibraryNode):
             if isinstance(node, (CopyLibraryNode, MemsetLibraryNode)):
                 return None
-            if getattr(node, 'schedule', None) == dtypes.ScheduleType.GPU_Device:
+            if node.schedule == dtypes.ScheduleType.GPU_Device:
                 return None
             if is_devicelevel_gpu(nsdfg, state, node):
                 return None
-            return f"LibraryNode with schedule {getattr(node, 'schedule', None)} outside a GPU_Device scope"
+            return f"LibraryNode with schedule {node.schedule} outside a GPU_Device scope"
         return None
 
     def insert_sync_tasklets(self, sdfg: SDFG, assignments: Dict[nodes.Node, int]):
@@ -391,7 +382,7 @@ class MonolithicSingleStreamGPUScheduler(GPUStreamSchedulingStrategy):
                    (src.storage in gpu_storages and dst.storage in cpu_storages):
                     return True
             elif isinstance(node, nodes.Tasklet):
-                code = node.code.as_string if hasattr(node.code, 'as_string') else str(node.code)
+                code = node.code.as_string
                 if 'cudaMemcpyHostToDevice' in code or 'cudaMemcpyDeviceToHost' in code or \
                    'hipMemcpyHostToDevice' in code or 'hipMemcpyDeviceToHost' in code:
                     return True
@@ -452,14 +443,12 @@ def _classify_node(node, sdfg: SDFG, state: SDFGState) -> _Kind:
             return _Kind.GPU
         return _Kind.CPU
     if isinstance(node, (nodes.MapEntry, nodes.ConsumeEntry)):
-        sched = getattr(node, 'schedule', None) or getattr(getattr(node, 'map', None), 'schedule', None)
-        if sched == dtypes.ScheduleType.GPU_Device:
+        # MapEntry carries the schedule on ``.map``; ConsumeEntry on ``.consume``.
+        scope_descriptor = node.map if isinstance(node, nodes.MapEntry) else node.consume
+        if scope_descriptor.schedule == dtypes.ScheduleType.GPU_Device:
             return _Kind.GPU
         # Sequential / CPU schedule -- recurse over the scope body.
-        try:
-            body_nodes = state.scope_subgraph(node, include_entry=False, include_exit=False).nodes()
-        except Exception:
-            body_nodes = []
+        body_nodes = state.scope_subgraph(node, include_entry=False, include_exit=False).nodes()
         return _fold_kinds(_classify_node(child, sdfg, state) for child in body_nodes)
     if isinstance(node, nodes.NestedSDFG):
         # If this NestedSDFG already sits inside a ``GPU_Device`` map, every tasklet inside it
@@ -487,18 +476,19 @@ def _classify_sdfg(sdfg: SDFG) -> _Kind:
     return _fold_kinds(kinds)
 
 
-def _iedge_reads_gpu_array(edge_data, sdfg: SDFG, gpu_written: Set[str]) -> bool:
+def _iedge_reads_gpu_array(edge_data: 'dace.InterstateEdge', sdfg: SDFG, gpu_written: Set[str]) -> bool:
     """True iff this interstate edge's condition/assignment reads a GPU-written array.
 
-    Uses ``InterstateEdge.read_symbols()`` (symbols in condition + assignment values) intersected
-    with ``sdfg.arrays``. If any of those array names overlap with arrays the GPU writes, the
-    host-side iedge eval depends on GPU output and needs a sync before it fires.
+    Uses :meth:`dace.InterstateEdge.read_symbols` (symbols in condition + assignment values)
+    intersected with ``sdfg.arrays``. If any of those array names overlap with arrays the GPU
+    writes, the host-side iedge eval depends on GPU output and needs a sync before it fires.
+
+    :param edge_data: The ``InterstateEdge`` data instance.
+    :param sdfg: The owning SDFG (used to look up array names).
+    :param gpu_written: Pre-computed set of GPU-written array names.
+    :return: ``True`` iff the iedge reads a GPU-written array.
     """
-    try:
-        read = edge_data.read_symbols()
-    except Exception:
-        return False
-    return bool(read & sdfg.arrays.keys() & gpu_written)
+    return bool(edge_data.read_symbols() & sdfg.arrays.keys() & gpu_written)
 
 
 def _classify_root_block(block) -> _Kind:
@@ -632,7 +622,7 @@ class AutoSingleStreamGPUScheduler(GPUStreamSchedulingStrategy):
                 for node in state.nodes():
                     # NOTE: This does not check "top level" for that the `scope_dict` would need to be inspected.
                     if _classify_node(node, nsdfg, state) == _Kind.MIXED:
-                        offenders.append(f"{type(node).__name__} '{getattr(node, 'label', node)}' in state "
+                        offenders.append(f"{type(node).__name__} '{node.label}' in state "
                                          f"'{state.label}' (SDFG '{nsdfg.name}')")
 
         if offenders:
@@ -674,7 +664,10 @@ class AutoSingleStreamGPUScheduler(GPUStreamSchedulingStrategy):
                     if not isinstance(node, nodes.AccessNode):
                         continue
                     desc = node.desc(nsdfg)
-                    if desc.storage != dtypes.StorageType.GPU_Global or not getattr(desc, 'pool', False):
+                    # Only ``data.Array`` carries a ``pool`` property; ``Scalar`` /
+                    # ``Stream`` don't, and would never be poolable anyway.
+                    if not (isinstance(desc, data.Array) and desc.storage == dtypes.StorageType.GPU_Global
+                            and desc.pool):
                         continue
                     assignments[node] = 0
                     if node.gpu_stream_id is None:
@@ -709,28 +702,20 @@ class AutoSingleStreamGPUScheduler(GPUStreamSchedulingStrategy):
 
         stream_array_name = get_gpu_stream_array_name()
 
-        edges_to_splice = []
-        for edge in list(sdfg.edges()):
-            src, dst = edge.src, edge.dst
-            if self._state_kinds.get(src) != _Kind.GPU:
-                continue
-            # GPU -> non-GPU: always splice. GPU -> GPU: splice only when the iedge reads a
-            # GPU-written array (host-side condition / assignment depending on kernel output).
-            dst_kind = self._state_kinds.get(dst, _Kind.CPU)
-            if dst_kind == _Kind.GPU and not _iedge_reads_gpu_array(edge.data, sdfg, self._gpu_written):
-                continue
-            edges_to_splice.append(edge)
-
         # Snapshot iedges first; splicing mutates each region's edge set.
-        # NOTE: This ignores edges between Regions. Essentially it assumes a flat state machine,
-        #   because it assumes that it can get the producing state by checking `edge.src`. However,
-        #   this might be an `AbstractControlflowRegion` with multiple terminal states.
+        # NOTE: This walks every nested CFG, so a sync inserted on an edge inside a
+        # ``LoopRegion`` / ``ConditionalBlock`` body lands in that owning region rather than
+        # in the root SDFG -- which is what we want for per-iteration sync semantics.
         edges_to_splice: List[Tuple['AbstractControlFlowRegion', any]] = []
         for region in sdfg.all_control_flow_regions(recursive=True):
             for edge in list(region.edges()):
                 src, dst = edge.src, edge.dst
-                if not (isinstance(src, SDFGState) and isinstance(dst, SDFGState)):
-                    continue
+                # Src can be any block kind -- a state directly, or a control-flow region
+                # (``LoopRegion``, ``ConditionalBlock``) whose payload contains GPU work --
+                # ``_classify_root_block`` already returns the union of the block's
+                # descendant kinds. Likewise dst can be any block kind: a GPU state followed
+                # by a ConditionalBlock / LoopRegion whose payload runs on the host still
+                # needs a sync inserted on the edge.
                 if self._state_kinds.get(src) != _Kind.GPU:
                     continue
                 # GPU -> non-GPU: always splice. GPU -> GPU: splice only when the iedge reads
@@ -740,8 +725,10 @@ class AutoSingleStreamGPUScheduler(GPUStreamSchedulingStrategy):
                     continue
                 edges_to_splice.append((region, edge))
 
-        for edge in edges_to_splice:
-            _splice_sync_state_on_edge(sdfg, edge, sdfg, stream_array_name)
+        # ``edges_to_splice`` carries ``(region, edge)`` tuples so the splicer can mutate the
+        # owning region's edge set (which may be a nested CFG, not the root SDFG).
+        for region, edge in edges_to_splice:
+            _splice_sync_state_on_edge(region, edge, sdfg, stream_array_name)
 
         self._add_sync_state(sdfg, stream_array_name)
 
@@ -762,20 +749,28 @@ class AutoSingleStreamGPUScheduler(GPUStreamSchedulingStrategy):
                 else:
                     # The node is nested inside a Map. We have to check if one of these Map
                     #  is a GPU Map. Otherwise we do not need to descend into it.
+                    # Walk up the scope chain via ``scope_dict``; without the per-iter step
+                    # the loop spins forever when no parent map carries a GPU schedule
+                    # (e.g. ``tests/transformations/gpu_grid_stride_tiling_test.py::
+                    # test_gpu_grid_stride_tiling_with_indirection``).
                     enclosing_scope = scope_dict[node]
                     while enclosing_scope is not None:
                         assert isinstance(enclosing_scope, nodes.MapEntry)
                         if enclosing_scope.map.schedule in dtypes.GPU_SCHEDULES:
                             break
+                        enclosing_scope = scope_dict[enclosing_scope]
                     else:
                         # It is not in a GPU scope, so we must process it.
                         self._add_sync_state(node.sdfg, stream_array_name)
 
-            # We need a sync after a GPU state. This is needed because stream assignment
-            #  only considers a single edge. If it would consider multiple edges it is not
-            #  needed.
+            # Append a program-end sync only at GPU *sink* states (those with no out-edges
+            # in their parent region). Non-sink GPU states are already covered by the
+            # edge-splicing loop in ``insert_sync_tasklets`` which inserts a sync state on
+            # every GPU -> non-GPU iedge; appending another trailing sync here would be
+            # redundant and produces the spurious extra ``__gpu_sync_after_*`` blocks
+            # observed after ``*_copyin`` / ``*_copyout`` scaffold states.
             if self._state_kinds.get(state) != _Kind.GPU:
                 continue
-
-            # Now append the sync.
+            if state.parent_graph.out_degree(state) > 0:
+                continue
             _append_program_end_sync_state(state.parent_graph, state, stream_array_name)
