@@ -65,7 +65,7 @@ class GPUCodegenPreprocessPipeline(Pipeline):
                                                                                              ReinferConnectorTypes)
         from dace.transformation.passes.gpu_specialization.insert_explicit_gpu_global_memory_copies import (
             InsertExplicitGPUGlobalMemoryCopies)
-        from dace.transformation.passes.promote_gpu_scalars_to_arrays import PromoteGPUScalarsToArrays
+        # from dace.transformation.passes.promote_gpu_scalars_to_arrays import PromoteGPUScalarsToArrays
         # Order constraints:
         #   * ``AssignmentAndCopyKernelToMemsetAndMemcpy`` before the stream scheduler: it moves
         #     the map's dynamic-input edges onto the new libnode and a pre-wired ``__stream``
@@ -83,7 +83,7 @@ class GPUCodegenPreprocessPipeline(Pipeline):
             synchronize_on_exit=Config.get('compiler', 'cuda', 'synchronize_on_exit'))
         super().__init__([
             InferDefaultSchedulesAndStorages(),
-            PromoteGPUScalarsToArrays(),
+            # PromoteGPUScalarsToArrays(),
             AssignmentAndCopyKernelToMemsetAndMemcpy(),
             InsertExplicitGPUGlobalMemoryCopies(),
             ExpandLibraryNodes(),
