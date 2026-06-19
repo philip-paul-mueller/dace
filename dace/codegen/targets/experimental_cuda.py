@@ -892,7 +892,7 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
         pool_global_dec = ''
         if self.has_pool:
             poolcfg = Config.get('compiler', 'cuda', 'mempool_release_threshold')
-            pool_variable = f"static {self.backend}MemPool_t GLOBAL_MEM_POOL;"
+            pool_variable = f"static {backend}MemPool_t GLOBAL_MEM_POOL;"
             pool_header = f'''
     {self.backend}MemPool_t mempool;
     {self.backend}DeviceGetDefaultMemPool(&GLOBAL_MEM_POOL, 0);
