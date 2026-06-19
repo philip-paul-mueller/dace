@@ -6,12 +6,14 @@
 typedef hipStream_t gpuStream_t;
 typedef hipEvent_t gpuEvent_t;
 typedef hipError_t gpuError_t;
+typedef hipMemPool_t gpuMemPool_t
 #define gpuGetLastError hipGetLastError
 #define gpuGetErrorString hipGetErrorString
 #else
 typedef cudaStream_t gpuStream_t;
 typedef cudaEvent_t gpuEvent_t;
 typedef cudaError_t gpuError_t;
+typedef cudaMemPool_t gpuMemPool_t
 #define gpuGetLastError cudaGetLastError
 #define gpuGetErrorString cudaGetErrorString
 #endif
@@ -50,6 +52,7 @@ struct Context {
   gpuStream_t *internal_streams;
   gpuEvent_t *events;
   gpuError_t lasterror;
+  gpuMemPool_t mempool;  //Will always be the default mempool, so no need to manage it.
   Context(int nstreams, int nevents)
       : num_streams(nstreams), num_events(nevents), lasterror((gpuError_t)0) {
     streams = new gpuStream_t[nstreams];

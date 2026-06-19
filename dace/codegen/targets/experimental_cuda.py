@@ -721,7 +721,7 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
         if nodedesc.pool:
             gpu_stream = self._gpu_stream_manager.get_stream_node(node)
             allocation_stream.write(
-                f'DACE_GPU_CHECK({self.backend}MallocFromPoolAsync((void**)&{dataname}, {arrsize_malloc}, GLOBAL_MEM_POOL, {gpu_stream}));\n',
+                f'DACE_GPU_CHECK({self.backend}MallocFromPoolAsync((void**)&{dataname}, {arrsize_malloc}, __state->gpu_context->mempool, {gpu_stream}));\n',
                 cfg, state_id, node)
             allocation_stream.write(generate_sync_debug_call())
         else:
@@ -841,7 +841,7 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
         return f'''
     {{  // Pre-grow the pool to the working-set size so no per-invocation allocation grows it.
         void *__dace_pool_prewarm;
-        DACE_GPU_CHECK({self.backend}MallocFromPoolAsync(&__dace_pool_prewarm, {' + '.join(terms)}, GLOBAL_MEM_POOL, {stream}));
+        DACE_GPU_CHECK({self.backend}MallocFromPoolAsync(&__dace_pool_prewarm, {' + '.join(terms)}, __state->gpu_context->mempool, {stream}));
         DACE_GPU_CHECK({self.backend}FreeAsync(__dace_pool_prewarm, {stream}));
     }}'''
 
@@ -889,15 +889,13 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
             params_comma = ', ' + params_comma
 
         pool_header = ''
-        pool_global_dec = ''
         if self.has_pool:
             poolcfg = Config.get('compiler', 'cuda', 'mempool_release_threshold')
-            pool_variable = f"static {self.backend}MemPool_t GLOBAL_MEM_POOL;"
             pool_header = f'''
-    {self.backend}MemPool_t mempool;
-    {self.backend}DeviceGetDefaultMemPool(&GLOBAL_MEM_POOL, 0);
+    {self.backend}MemPool_t* mempool_ptr = &(__state->gpu_context->mempool);
+    {self.backend}DeviceGetDefaultMemPool(mempool_ptr, 0);
     uint64_t threshold = {poolcfg if poolcfg != -1 else 'UINT64_MAX'};
-    {self.backend}MemPoolSetAttribute(GLOBAL_MEM_POOL, {self.backend}MemPoolAttrReleaseThreshold, &threshold);
+    {self.backend}MemPoolSetAttribute(*mempool_ptr, {self.backend}MemPoolAttrReleaseThreshold, &threshold);
 '''
         #pool_prewarm = self._pool_prewarm('__state->gpu_context->streams[0]') if self.has_pool else ''
         pool_prewarm = ""
