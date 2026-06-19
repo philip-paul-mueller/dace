@@ -721,7 +721,7 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
         if nodedesc.pool:
             gpu_stream = self._gpu_stream_manager.get_stream_node(node)
             allocation_stream.write(
-                f'DACE_GPU_CHECK({self.backend}MallocFromPoolAsync((void**)&{dataname}, {arrsize_malloc}, GLOBAL_MEM_POOL, {gpu_stream}));\n',
+                f'DACE_GPU_CHECK({self.backend}MallocAsync((void**)&{dataname}, {arrsize_malloc}, {gpu_stream}));\n',
                 cfg, state_id, node)
             allocation_stream.write(generate_sync_debug_call())
         else:
@@ -841,7 +841,7 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
         return f'''
     {{  // Pre-grow the pool to the working-set size so no per-invocation allocation grows it.
         void *__dace_pool_prewarm;
-        DACE_GPU_CHECK({self.backend}MallocFromPoolAsync(&__dace_pool_prewarm, {' + '.join(terms)}, GLOBAL_MEM_POOL, {stream}));
+        DACE_GPU_CHECK({self.backend}MallocAsync(&__dace_pool_prewarm, {' + '.join(terms)}, {stream}));
         DACE_GPU_CHECK({self.backend}FreeAsync(__dace_pool_prewarm, {stream}));
     }}'''
 
@@ -889,19 +889,16 @@ class ExperimentalCUDACodeGen(TargetCodeGenerator):
             params_comma = ', ' + params_comma
 
         pool_header = ''
-        pool_global_dec = ''
         if self.has_pool:
             poolcfg = Config.get('compiler', 'cuda', 'mempool_release_threshold')
-            pool_variable = f"static {backend}MemPool_t GLOBAL_MEM_POOL;"
             pool_header = f'''
     cudaMemPool_t mempool;
-    cudaDeviceGetDefaultMemPool(&GLOBAL_MEM_POOL, 0);
+    cudaDeviceGetDefaultMemPool(&mempool, 0);
     uint64_t threshold = {poolcfg if poolcfg != -1 else 'UINT64_MAX'};
-    cudaMemPoolSetAttribute(GLOBAL_MEM_POOL, cudaMemPoolAttrReleaseThreshold, &threshold);
+    cudaMemPoolSetAttribute(mempool, cudaMemPoolAttrReleaseThreshold, &threshold);
 '''
 
-        #pool_prewarm = self._pool_prewarm('__state->gpu_context->streams[0]') if self.has_pool else ''
-        pool_prewarm = ""
+        pool_prewarm = self._pool_prewarm('__state->gpu_context->streams[0]') if self.has_pool else ''
 
         self._codeobject.code = """
 #include <{backend_header}>
@@ -913,7 +910,6 @@ DACE_EXPORTED int __dace_init_experimental_cuda({sdfg_state_name} *__state{param
 DACE_EXPORTED int __dace_exit_experimental_cuda({sdfg_state_name} *__state);
 
 {other_globalcode}
-{pool_variable}
 
 int __dace_init_experimental_cuda({sdfg_state_name} *__state{params}) {{
     int count;
@@ -989,7 +985,6 @@ int __dace_exit_experimental_cuda({sdfg_state_name} *__state) {{
            backend_header=backend_header,
            pool_header=pool_header,
            pool_prewarm=pool_prewarm,
-           pool_variable=pool_variable,
            sdfg=self._global_sdfg)
 
         return [self._codeobject]
