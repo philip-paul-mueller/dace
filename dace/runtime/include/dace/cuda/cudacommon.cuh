@@ -6,14 +6,14 @@
 typedef hipStream_t gpuStream_t;
 typedef hipEvent_t gpuEvent_t;
 typedef hipError_t gpuError_t;
-typedef hipMemPool_t gpuMemPool_t
+typedef hipMemPool_t gpuMemPool_t;
 #define gpuGetLastError hipGetLastError
 #define gpuGetErrorString hipGetErrorString
 #else
 typedef cudaStream_t gpuStream_t;
 typedef cudaEvent_t gpuEvent_t;
 typedef cudaError_t gpuError_t;
-typedef cudaMemPool_t gpuMemPool_t
+typedef cudaMemPool_t gpuMemPool_t;
 #define gpuGetLastError cudaGetLastError
 #define gpuGetErrorString cudaGetErrorString
 #endif
