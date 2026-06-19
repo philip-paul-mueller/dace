@@ -910,7 +910,6 @@ DACE_EXPORTED int __dace_init_experimental_cuda({sdfg_state_name} *__state{param
 DACE_EXPORTED int __dace_exit_experimental_cuda({sdfg_state_name} *__state);
 
 {other_globalcode}
-{pool_variable}
 
 int __dace_init_experimental_cuda({sdfg_state_name} *__state{params}) {{
     int count;
@@ -986,7 +985,6 @@ int __dace_exit_experimental_cuda({sdfg_state_name} *__state) {{
            backend_header=backend_header,
            pool_header=pool_header,
            pool_prewarm=pool_prewarm,
-           pool_variable=pool_variable,
            sdfg=self._global_sdfg)
 
         return [self._codeobject]
