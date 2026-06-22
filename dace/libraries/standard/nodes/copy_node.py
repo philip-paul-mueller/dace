@@ -1,10 +1,10 @@
 # Copyright 2019-2026 ETH Zurich and the DaCe authors. All rights reserved.
 """ ``CopyLibraryNode`` representing copies explicitly. """
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import dace
-from dace import data, library, nodes, dtypes, symbolic
+from dace import data, library, nodes, dtypes, symbolic, subsets as sbs
 from dace.codegen.common import sym2cpp, get_gpu_backend
 from dace.libraries.standard.helper import CURRENT_STREAM_NAME, auto_dispatch, collapse_shape_and_strides
 from dace.sdfg.scope import is_devicelevel_gpu, is_in_scope
@@ -405,9 +405,10 @@ def _make_memcpy_tasklet(node: "CopyLibraryNode", parent_state: dace.SDFGState, 
         would overrun the region. Use ``MappedTasklet`` for strided subsets.
     """
     label = "MemcpyCUDA1D" if cuda else "MemcpyCPU"
-    inp_name, inp, in_subset, out_name, out, out_subset = node.validate(parent_state.sdfg,
-                                                                        parent_state,
-                                                                        allow_cross_storage=cuda)
+    inp_name, inp, in_subset, out_name, out, out_subset, inp_data, out_data = node.validate(parent_state.sdfg,
+                                                                                            parent_state,
+                                                                                            allow_cross_storage=cuda,
+                                                                                            ret_data=True)
     single_elt = (in_subset.num_elements_exact() == 1 and out_subset.num_elements_exact() == 1)
     if single_elt:
         # For a single element we must/can ignore the strides.
@@ -857,13 +858,18 @@ class CopyLibraryNode(nodes.LibraryNode):
             return dtypes.StorageType.Default
         return state.sdfg.arrays[outer.data].storage
 
-    def validate(self, sdfg, state, allow_cross_storage=True):
+    def validate(
+        self,
+        sdfg: dace.SDFG,
+        state: dace.SDFGState,
+        allow_cross_storage: bool = True,
+    ) -> Tuple[str, data.Data, sbs.Subset, str, data.Data, sbs.Subset]:
         """Resolve in/out edges, names, and subsets.
 
         :param sdfg: SDFG containing ``state``.
         :param state: state containing this libnode.
         :param allow_cross_storage: when False, require matching src/dst storages.
-        :returns: ``(inp_name, inp, in_subset, out_name, out, out_subset)``.
+        :returns: ``(inp_name, inp, in_subset, out_name, out, out_subset)``
         :raises ValueError: the libnode is not wired with exactly one input
             and one output data edge, dtypes mismatch, an extraneous
             non-reserved input connector is wired, or (when
@@ -874,9 +880,9 @@ class CopyLibraryNode(nodes.LibraryNode):
             raise ValueError(f"{type(self).__name__} expects exactly one "
                              f"``{CopyLibraryNode.OUTPUT_CONNECTOR_NAME}`` output edge.")
         oe = out_edges[0]
-        out = sdfg.arrays[oe.data.data]
+        out_name = oe.data.data
+        out = sdfg.arrays[out_name]
         out_subset = oe.data.subset
-        out_name = oe.src_conn
 
         # Reject any non-reserved input connector: the libnode does not accept
         # dynamic inputs (see class docstring's design rationale).
@@ -891,9 +897,9 @@ class CopyLibraryNode(nodes.LibraryNode):
             raise ValueError(f"{type(self).__name__} expects exactly one data input edge "
                              f"connected to the ``{CopyLibraryNode.INPUT_CONNECTOR_NAME}`` connector.")
         ie = in_edges[0]
-        inp = sdfg.arrays[ie.data.data]
+        inp_name = ie.data.data
+        inp = sdfg.arrays[inp_name]
         in_subset = ie.data.subset
-        inp_name = ie.dst_conn
 
         if inp.dtype != out.dtype:
             raise ValueError(f"Input and output data types must match (got {inp.dtype} vs {out.dtype}).")
@@ -903,4 +909,4 @@ class CopyLibraryNode(nodes.LibraryNode):
                              f"(got {inp.storage} vs {out.storage}). Use a cross-storage "
                              f"expansion or the pure fallback.")
 
-        return inp_name, inp, in_subset, out_name, out, out_subset
+        return (inp_name, inp, in_subset, out_name, out, out_subset)
