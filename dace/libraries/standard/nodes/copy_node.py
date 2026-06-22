@@ -405,9 +405,9 @@ def _make_memcpy_tasklet(node: "CopyLibraryNode", parent_state: dace.SDFGState, 
         would overrun the region. Use ``MappedTasklet`` for strided subsets.
     """
     label = "MemcpyCUDA1D" if cuda else "MemcpyCPU"
-    inp_name, inp, in_subset, out_name, out, out_subset, inp_data, out_data = node.validate(parent_state.sdfg,
-                                                                                            parent_state,
-                                                                                            allow_cross_storage=cuda)
+    inp_name, inp, in_subset, out_name, out, out_subset = node.validate(parent_state.sdfg,
+                                                                        parent_state,
+                                                                        allow_cross_storage=cuda)
     single_elt = (in_subset.num_elements_exact() == 1 and out_subset.num_elements_exact() == 1)
     if single_elt:
         # For a single element we must/can ignore the strides.
