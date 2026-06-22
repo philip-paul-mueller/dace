@@ -944,6 +944,10 @@ class Range(Subset):
             Returns False on all arrays that are not have a packed layout,
             meaning that the complete array is contiguously stored in 1D memory.
         """
+
+        if self.dims() != len(array.shape):
+            raise ValueError(f'Subset has dimension {self.dims()}, but data descriptor has {len(array.shape)}')
+
         # Any step size != 1 -> not contiguous
         if any(s != 1 for (_, _, s) in self):
             return False
@@ -958,7 +962,17 @@ class Range(Subset):
             expr_lens = list(reversed([((e + 1) - b) for (b, e, s) in self]))
             shape_dims = list(reversed(array.shape))
         else:
-            return False
+            # Special case.
+            found_copy_dim = False
+            for copy_elem, stride in zip(self.size(), array.strides):
+                if (copy_elem == 1) == False:
+                    continue
+                if found_copy_dim:
+                    return False
+                if (stride == 1) == False:
+                    return False
+                found_copy_dim = True
+            return found_copy_dim
 
         # Check contiguity: once we find a partial dimension, all remaining must be length 1
         for i, (expr_len, dim) in enumerate(zip(expr_lens, shape_dims)):
